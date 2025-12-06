@@ -2,18 +2,34 @@
 
 from __future__ import annotations
 
+import pickle
 from pathlib import Path
 import networkx as nx
 
 from kg_ai_papers.config.settings import settings
 
 
-def save_graph(G: nx.MultiDiGraph, name: str = "graph") -> Path:
+def save_graph(G: nx.MultiDiGraph, name: str = None) -> Path:
+    """
+    Save the graph to disk using Python pickle.
+    """
+    name = name or settings.GRAPH_DEFAULT_NAME
     path = settings.graph_dir / f"{name}.gpickle"
-    nx.write_gpickle(G, path)
+
+    with open(path, "wb") as f:
+        pickle.dump(G, f)
+
     return path
 
 
-def load_graph(name: str = "graph") -> nx.MultiDiGraph:
+def load_graph(name: str = None) -> nx.MultiDiGraph:
+    """
+    Load the graph from disk using Python pickle.
+    """
+    name = name or settings.GRAPH_DEFAULT_NAME
     path = settings.graph_dir / f"{name}.gpickle"
-    return nx.read_gpickle(path)
+
+    with open(path, "rb") as f:
+        G = pickle.load(f)
+
+    return G

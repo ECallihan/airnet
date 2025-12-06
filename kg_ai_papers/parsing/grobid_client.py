@@ -3,7 +3,7 @@
 import os
 import requests
 
-from kg_ai_papers.config import settings
+from kg_ai_papers.config.settings import settings
 
 
 class GrobidClientError(Exception):
