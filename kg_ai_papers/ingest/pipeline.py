@@ -1,12 +1,14 @@
-# kg_ai_papers/ingest/pipeline.py
-
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from kg_ai_papers.grobid_client import GrobidClient
+import requests
+
+# Keep the import for type hints / compatibility, even if we don't rely on it.
+from kg_ai_papers.grobid_client import GrobidClient  # type: ignore[unused-import]
 from kg_ai_papers.tei_parser import extract_sections_from_tei
 from kg_ai_papers.nlp.concept_extraction import (
     SectionConcept,
@@ -16,6 +18,9 @@ from kg_ai_papers.nlp.concept_extraction import (
 )
 from kg_ai_papers.models.paper import Paper
 
+# -----------------------------------------------------------------------------
+# Public result type for downstream consumers
+# -----------------------------------------------------------------------------
 
 @dataclass
 class IngestedPaperResult:
@@ -32,6 +37,10 @@ class IngestedPaperResult:
     references: List[str]
 
 
+# -----------------------------------------------------------------------------
+# Internal ingestion representation (PDF -> TEI -> concepts)
+# -----------------------------------------------------------------------------
+
 @dataclass
 class IngestedPaper:
     """
@@ -43,20 +52,76 @@ class IngestedPaper:
       - sent to a graph store like Neo4j
     """
 
-    paper_id: str
+    arxiv_id: str
     pdf_path: Path
     tei_path: Path
     sections: Sequence[Any]  # usually PaperSection, but kept loose for easier testing
     section_concepts: List[SectionConcept]
     concept_summaries: Dict[str, ConceptSummary]
 
+# -----------------------------------------------------------------------------
+# Low-level HTTP call to GROBID (fallback when no usable client is provided)
+# -----------------------------------------------------------------------------
+
+def _process_pdf_via_http(pdf_path: Path, work_dir: Optional[Path] = None) -> Path:
+    """
+    Send a PDF to GROBID /api/processFulltextDocument and return the TEI path.
+
+    Uses environment variable GROBID_URL if set, otherwise http://localhost:8070.
+    """
+    pdf_path = Path(pdf_path)
+    if not pdf_path.exists():
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    base_url = os.getenv("GROBID_URL", "http://localhost:8070").rstrip("/")
+    timeout = int(os.getenv("GROBID_TIMEOUT", "60"))
+
+    # Choose a TEI output directory
+    base_dir = work_dir if work_dir is not None else pdf_path.parent
+    tei_dir = base_dir / "tei"
+    tei_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional health check
+    try:
+        r = requests.get(f"{base_url}/api/isalive", timeout=timeout)
+        r.raise_for_status()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"GROBID at {base_url!r} did not respond correctly to /api/isalive"
+        ) from exc
+
+    url = f"{base_url}/api/processFulltextDocument"
+    files = {"input": pdf_path.open("rb")}
+    params = {
+        "consolidateHeader": 1,
+        "consolidateCitations": 0,
+        "segmentSentences": 0,
+    }
+
+    try:
+        resp = requests.post(url, files=files, data=params, timeout=timeout)
+    finally:
+        files["input"].close()
+
+    resp.raise_for_status()
+
+    tei_xml = resp.text
+    tei_path = tei_dir / f"{pdf_path.stem}.tei.xml"
+    tei_path.write_text(tei_xml, encoding="utf-8")
+    return tei_path
+
+# -----------------------------------------------------------------------------
+# Core ingestion: PDF -> TEI -> sections -> concepts
+# -----------------------------------------------------------------------------
 
 def ingest_pdf(
-    pdf_path: Path,
+    pdf_path: Optional[Path] = None,
     *,
-    paper_id: Optional[str] = None,
-    grobid_client: GrobidClient,
+    arxiv_id: Optional[str] = None,
+    grobid_client: Optional[Any] = None,
     neo4j_session: Optional[Any] = None,
+    work_dir: Optional[Path] = None,
+    **_: Any,  # absorb any unexpected kwargs for backwards compatibility
 ) -> IngestedPaper:
     """
     End-to-end ingestion for a single PDF:
@@ -66,41 +131,62 @@ def ingest_pdf(
           -> (concept_extraction) -> section concepts + aggregated concept summaries
           -> (optional) persist to Neo4j
 
-    Parameters
-    ----------
-    pdf_path:
-        Path to the input PDF.
-    paper_id:
-        Logical identifier for the paper (e.g. arXiv ID). If omitted, uses the
-        PDF stem (filename without extension).
-    grobid_client:
-        Instance of GrobidClient (or a drop-in with .process_pdf(Path) -> Path).
-    neo4j_session:
-        Optional Neo4j session-like object with a .run(cypher: str, **params)
-        method. If provided, the ingested paper will be persisted to Neo4j.
+    Call patterns supported:
 
-    Returns
-    -------
-    IngestedPaper
-        Aggregated representation of the paper and its concepts.
+      - ingest_pdf(pdf_path, arxiv_id=..., grobid_client=...)
+      - ingest_pdf(arxiv_id=..., grobid_client=..., work_dir=...)
+      - ingest_pdf(pdf_path)  # everything inferred
+
+    If pdf_path is not provided, we derive it as work_dir / f"{arxiv_id}.pdf".
+    If that file does not exist, we try to download it from arXiv.
     """
-    if paper_id is None:
-        paper_id = pdf_path.stem
+    # Infer pdf_path if only arxiv_id + work_dir were given
+    if pdf_path is None:
+        if arxiv_id is None:
+            raise ValueError(
+                "ingest_pdf: either pdf_path must be provided, or "
+                "both arxiv_id and work_dir must be given."
+            )
+        if work_dir is None:
+            raise ValueError(
+                "ingest_pdf: pdf_path is None and work_dir is None; cannot "
+                "infer PDF path. Provide pdf_path or (arxiv_id + work_dir)."
+            )
+        pdf_path = Path(work_dir) / f"{arxiv_id}.pdf"
 
-    # 1) PDF -> TEI via GROBID
-    tei_path = grobid_client.process_pdf(pdf_path)
+    pdf_path = Path(pdf_path)
+
+    # If arxiv_id still isn't set, derive it from the file name
+    if arxiv_id is None:
+        arxiv_id = pdf_path.stem
+
+    # Ensure the PDF actually exists; if not, try to download it from arXiv
+    if not pdf_path.exists():
+        if arxiv_id is not None:
+            download_dir = work_dir if work_dir is not None else pdf_path.parent
+            pdf_path = _download_arxiv_pdf(arxiv_id, Path(download_dir))
+        else:
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
+
+    # 1) PDF -> TEI via either an external GrobidClient or our HTTP fallback
+    if grobid_client is not None and hasattr(grobid_client, "process_pdf"):
+        tei_path = grobid_client.process_pdf(pdf_path)
+    else:
+        tei_path = _process_pdf_via_http(pdf_path, work_dir=work_dir)
 
     # 2) TEI -> sections
     sections = extract_sections_from_tei(tei_path)
 
     # 3) sections -> per-section concepts
-    section_concepts = extract_concepts_from_sections(sections, paper_id=paper_id)
+    # NOTE: concept_extraction currently expects the kwarg name `paper_id`,
+    # so we pass the arxiv_id under that name.
+    section_concepts = extract_concepts_from_sections(sections, paper_id=arxiv_id)
 
     # 4) aggregate to ConceptSummary per concept
     concept_summaries = aggregate_section_concepts(section_concepts)
 
     ingested = IngestedPaper(
-        paper_id=paper_id,
+        arxiv_id=arxiv_id,
         pdf_path=pdf_path,
         tei_path=tei_path,
         sections=list(sections),
@@ -114,6 +200,9 @@ def ingest_pdf(
 
     return ingested
 
+# -----------------------------------------------------------------------------
+# Neo4j persistence
+# -----------------------------------------------------------------------------
 
 def persist_ingested_paper_to_neo4j(session: Any, ingested: IngestedPaper) -> None:
     """
@@ -131,11 +220,7 @@ def persist_ingested_paper_to_neo4j(session: Any, ingested: IngestedPaper) -> No
           weighted_score,
           mentions_by_section
       }]->(:Concept)
-
-    This focuses on paper <-> concept relationships; citation/influence edges
-    can be added later using the existing NetworkX graph as ground truth.
     """
-    # 1) Upsert the Paper node
     session.run(
         """
         MERGE (p:Paper {arxiv_id: $arxiv_id})
@@ -144,7 +229,7 @@ def persist_ingested_paper_to_neo4j(session: Any, ingested: IngestedPaper) -> No
         ON MATCH SET  p.pdf_path = $pdf_path,
                       p.tei_path = $tei_path
         """,
-        arxiv_id=ingested.paper_id,
+        arxiv_id= ingested.arxiv_id,
         pdf_path=str(ingested.pdf_path),
         tei_path=str(ingested.tei_path),
     )
@@ -152,7 +237,6 @@ def persist_ingested_paper_to_neo4j(session: Any, ingested: IngestedPaper) -> No
     if not ingested.concept_summaries:
         return
 
-    # 2) Upsert Concept nodes + MENTIONS relationships
     concepts_param = [
         {
             "concept_key": key,
@@ -177,65 +261,120 @@ def persist_ingested_paper_to_neo4j(session: Any, ingested: IngestedPaper) -> No
             r.weighted_score = c.weighted_score,
             r.mentions_by_section = c.mentions_by_section
         """,
-        arxiv_id=ingested.paper_id,
+        arxiv_id=ingested.arxiv_id,
         concepts=concepts_param,
     )
 
+# -----------------------------------------------------------------------------
+# Helper: download arXiv PDF into a work directory
+# -----------------------------------------------------------------------------
 
-# --- Optional convenience: ingest + update NetworkX graph --------------------
+def _download_arxiv_pdf(arxiv_id: str, work_dir: Path) -> Path:
+    """
+    Download the PDF for a given arXiv ID into work_dir and return its path.
 
+    Uses the `arxiv` Python package.
+    """
+    import arxiv  # local import to avoid a hard dependency at import time
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    search = arxiv.Search(id_list=[arxiv_id])
+    client = arxiv.Client()
+    results = client.results(search)
+
+    try:
+        result = next(results)
+    except StopIteration:
+        raise RuntimeError(f"No arXiv result found for id {arxiv_id!r}")
+
+    pdf_path = work_dir / f"{arxiv_id}.pdf"
+    result.download_pdf(filename=str(pdf_path))
+    return pdf_path
+
+# -----------------------------------------------------------------------------
+# Public convenience: ingest directly from arXiv ID
+# -----------------------------------------------------------------------------
+
+def ingest_arxiv_paper(
+    *,
+    arxiv_id: str,
+    work_dir: Path,
+    grobid_client: Optional[Any] = None,
+    neo4j_session: Optional[Any] = None,
+    references: Optional[List[str]] = None,
+) -> IngestedPaperResult:
+    """
+    High-level ingestion entrypoint for a paper identified by arxiv_id.
+
+    This is the function your CLI calls:
+
+        ingest_arxiv_paper(arxiv_id=..., work_dir=...)
+
+    Steps:
+      1. Download the PDF for arxiv_id into work_dir.
+      2. Run ingest_pdf (GROBID → TEI → sections → concepts).
+      3. Build an IngestedPaperResult with a (possibly minimal) Paper model.
+    """
+    work_dir = Path(work_dir)
+
+    # 1) Download the PDF
+    pdf_path = _download_arxiv_pdf(arxiv_id, work_dir)
+
+    # 2) Run the core ingestion
+    ingested = ingest_pdf(
+        pdf_path,
+        arxiv_id=arxiv_id,
+        grobid_client=grobid_client,
+        neo4j_session=neo4j_session,
+        work_dir=work_dir,
+    )
+
+    # 3) Build a (currently minimal) Paper model
+    paper = Paper(arxiv_id=arxiv_id)
+
+    if references is None:
+        references = []
+
+    return IngestedPaperResult(
+        paper=paper,
+        concept_summaries=ingested.concept_summaries,
+        references=references,
+    )
+
+# -----------------------------------------------------------------------------
+# Optional convenience: ingest + update NetworkX graph in one call
+# -----------------------------------------------------------------------------
 
 def ingest_pdf_and_update_graph(
-    G: "Any",  # typically nx.MultiDiGraph; kept loose to avoid hard dependency here
+    G: Any,  # typically nx.MultiDiGraph; kept loose to avoid hard dependency here
     pdf_path: Path,
     *,
-    grobid_client: GrobidClient,
+    grobid_client: Optional[Any] = None,
     neo4j_session: Optional[Any] = None,
     paper: Optional[Paper] = None,
-    paper_id: Optional[str] = None,
+    arxiv_id: Optional[str] = None,
     references: Optional[List[str]] = None,
 ) -> IngestedPaperResult:
     """
     Convenience helper: ingest a PDF, optionally persist to Neo4j, update the
     in-memory NetworkX graph, and return a high-level IngestedPaperResult.
-
-    Parameters
-    ----------
-    G:
-        A NetworkX MultiDiGraph (or compatible) representing the in-memory KG.
-    pdf_path:
-        Path to the input PDF.
-    grobid_client:
-        Grobid client instance used by `grobid_client.process_pdf`.
-    neo4j_session:
-        Optional Neo4j session; passed through to `ingest_pdf`.
-    paper:
-        Optional pre-built Paper model. If provided, its `arxiv_id` drives
-        the paper_id used throughout.
-    paper_id:
-        Optional explicit paper_id / arxiv_id. If both `paper` and `paper_id`
-        are None, we fall back to `pdf_path.stem`.
-    references:
-        Optional list of arxiv_ids this paper cites. For now this usually
-        remains empty until citation extraction is wired in.
-
-    Returns
-    -------
-    IngestedPaperResult
-        High-level bundle with Paper + concept summaries + references.
     """
+    pdf_path = Path(pdf_path)
+
     # Resolve the canonical id we will use everywhere
     if paper is not None:
         resolved_id = paper.arxiv_id
-    elif paper_id is not None:
-        resolved_id = paper_id
+    elif arxiv_id is not None:
+        resolved_id = arxiv_id
     else:
         resolved_id = pdf_path.stem
 
     # Run the core ingestion (PDF → TEI → sections → concepts [+ Neo4j])
     ingested = ingest_pdf(
         pdf_path,
-        paper_id=resolved_id,
+        arxiv_id=resolved_id,
         grobid_client=grobid_client,
         neo4j_session=neo4j_session,
     )
@@ -244,8 +383,8 @@ def ingest_pdf_and_update_graph(
     if paper is None:
         paper = Paper(arxiv_id=resolved_id)
 
-    # References are currently optional / placeholder until TEI citation
-    # extraction or arXiv metadata wiring is added.
+    # References are optional / placeholder until TEI citation extraction or
+    # arXiv metadata wiring is added.
     if references is None:
         references = []
 
@@ -256,9 +395,7 @@ def ingest_pdf_and_update_graph(
     )
 
     # Update the in-memory graph using the standard helper.
-    # Local import to avoid import-time cycles.
     from kg_ai_papers.graph.builder import update_graph_with_ingested_paper
-
     update_graph_with_ingested_paper(G, result)
 
     return result

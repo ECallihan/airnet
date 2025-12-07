@@ -2,25 +2,25 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Sequence, Tuple, Optional, Iterable
-from kg_ai_papers.config.settings import settings, Settings, RuntimeMode
+from functools import lru_cache
+from typing import Dict, List, Mapping, Sequence, Tuple, Optional, Iterable, Any
 
-from kg_ai_papers.tei_parser import PaperSection
-from kg_ai_papers.documents import PaperDocument
-from dataclasses import dataclass
 from keybert import KeyBERT
 
-from kg_ai_papers.config.settings import settings
+from kg_ai_papers.config.settings import settings, Settings, RuntimeMode
+from kg_ai_papers.tei_parser import PaperSection
+from kg_ai_papers.documents import PaperDocument
 from kg_ai_papers.models.concept import Concept, ConceptOccurrence
 from kg_ai_papers.models.paper import Paper
 
-_settings = Settings()
+
+# ---------------------------------------------------------------------------
+# Runtime-mode helpers
+# ---------------------------------------------------------------------------
 
 # Section kinds/titles to prioritize in LIGHT mode.
-# This is just a heuristic – you can refine it later.
 _LIGHT_MODE_IMPORTANT_SECTIONS = {
     "abstract",
     "introduction",
@@ -30,48 +30,8 @@ _LIGHT_MODE_IMPORTANT_SECTIONS = {
     "summary",
 }
 
-# ---------------------------------------------------------------------------
-# Runtime-mode helpers for concept extraction
-# ---------------------------------------------------------------------------
-
-# How many concepts we allow per paper in each mode.
-# These are intentionally conservative so STANDARD behaves as before.
-_RUNTIME_MAX_CONCEPTS_STANDARD = 50
-_RUNTIME_MAX_CONCEPTS_LIGHT = 10
-
-
-def _should_extract_concepts() -> bool:
-    """
-    Returns False in OFF mode so we can bail out early.
-    """
-    return settings.runtime_mode != RuntimeMode.OFF
-
-
-def _max_concepts_for_mode() -> int:
-    """
-    Returns how many concepts to keep given the current runtime mode.
-    STANDARD uses a high cap so existing behavior is effectively unchanged.
-    """
-    if settings.runtime_mode == RuntimeMode.LIGHT:
-        return _RUNTIME_MAX_CONCEPTS_LIGHT
-    # STANDARD and any future modes default to a high cap.
-    return _RUNTIME_MAX_CONCEPTS_STANDARD
-
-# ---------------------------------------------------------------------------
-# Runtime-mode helpers for concept extraction
-# ---------------------------------------------------------------------------
-
 # Cap on how many section-level concept mentions we keep in LIGHT mode.
-# STANDARD mode effectively has no cap at this layer.
 _RUNTIME_MAX_SECTION_CONCEPTS_LIGHT = 50
-
-
-def _should_extract_concepts() -> bool:
-    """
-    OFF mode: skip concept extraction entirely.
-    LIGHT/STANDARD: allow extraction.
-    """
-    return settings.runtime_mode != RuntimeMode.OFF
 
 
 def _max_section_concepts_for_mode() -> Optional[int]:
@@ -81,8 +41,13 @@ def _max_section_concepts_for_mode() -> Optional[int]:
     """
     if settings.runtime_mode == RuntimeMode.LIGHT:
         return _RUNTIME_MAX_SECTION_CONCEPTS_LIGHT
-    # STANDARD (and future heavier modes) get full detail.
+    # STANDARD and HEAVY: effectively no cap at this layer
     return None
+
+
+# ---------------------------------------------------------------------------
+# KeyBERT-backed concept extractor
+# ---------------------------------------------------------------------------
 
 class ConceptExtractor:
     """
@@ -105,7 +70,6 @@ class ConceptExtractor:
             - If a string, pass it through to KeyBERT(model=...).
         """
         if model_name is None:
-            # KeyBERT default model
             self._kw_model = KeyBERT()
         else:
             self._kw_model = KeyBERT(model=model_name)
@@ -170,7 +134,7 @@ class ConceptExtractor:
         """
         Mutate `paper` in-place with:
           - paper.paper_level_concepts as List[Tuple[label, score]]
-          - paper.concepts (can be a richer list of Concept objects)
+          - paper.concepts (richer list of Concept objects)
           - section-level concepts attached to each Section (as ConceptOccurrence[])
         """
         # ---- paper-level concepts ----
@@ -187,13 +151,10 @@ class ConceptExtractor:
         else:
             paper_concept_objs = []
 
-        # Expose as list of (label, score) tuples to satisfy tests and
-        # tuple-oriented code paths
+        # Expose as list of (label, score) tuples
         paper.paper_level_concepts = [
             (c.label, c.weight) for c in paper_concept_objs
         ]
-
-        # Keep a richer representation in `paper.concepts` if needed
         paper.concepts = paper_concept_objs
 
         # ---- section-level concepts (if sections exist) ----
@@ -207,7 +168,6 @@ class ConceptExtractor:
                     continue
 
                 truncated = combined[: settings.MAX_SECTION_CHARS]
-
                 raw_concepts = self.extract_concepts(truncated, top_n=sec_top)
 
                 occurrences: List[ConceptOccurrence] = []
@@ -222,6 +182,7 @@ class ConceptExtractor:
                         )
                     )
 
+                # Attach to section in a flexible way
                 if hasattr(sec, "concepts"):
                     setattr(sec, "concepts", occurrences)
                 else:
@@ -229,7 +190,6 @@ class ConceptExtractor:
                         sec.concepts = occurrences  # type: ignore[attr-defined]
                     except Exception:
                         pass
-
 
     def enrich_paper(self, paper: Paper) -> None:
         """
@@ -242,6 +202,11 @@ class ConceptExtractor:
             paper_top_n=settings.PAPER_TOP_CONCEPTS,
         )
 
+
+# ---------------------------------------------------------------------------
+# Dataclasses for section-level concepts and aggregated summaries
+# ---------------------------------------------------------------------------
+
 @dataclass
 class SectionConcept:
     """
@@ -253,115 +218,10 @@ class SectionConcept:
         section_title: Title of the section (e.g. "Introduction", "Methods").
         section_level: Section nesting level (1 = top-level, if available).
     """
-    concept: "Concept"
+    concept: Concept
     paper_id: Optional[str] = None
     section_title: Optional[str] = None
     section_level: Optional[int] = None
-
-def extract_concepts_from_sections(
-    sections: Sequence[PaperSection],
-    paper_id: Optional[str] = None,
-) -> List[SectionConcept]:
-    """
-    Run the existing text-based concept extraction over each PaperSection.
-
-    Runtime-aware behavior:
-      - OFF     → return an empty list (skip heavy work entirely).
-      - LIGHT   → run full extraction but truncate the total number of
-                  SectionConcepts to a smaller cap.
-      - STANDARD (default) → behave as before, apart from the optional cap
-                             (which is effectively inactive for small inputs).
-
-    This preserves your existing heuristics in extract_concepts(text),
-    but enriches the results with section metadata so downstream
-    influence modeling can weigh concepts differently by section.
-    """
-    # OFF mode: skip concept extraction altogether
-    if not _should_extract_concepts():
-        return []
-
-    results: List[SectionConcept] = []
-
-    for sec in sections:
-        if not sec.text:
-            continue
-
-        # Re-use your existing function; do NOT change its behavior.
-        concepts = extract_concepts(sec.text)
-
-        for c in concepts:
-            results.append(
-                SectionConcept(
-                    concept=c,
-                    paper_id=paper_id,
-                    section_title=sec.title or None,
-                    section_level=sec.level,
-                )
-            )
-
-    # LIGHT mode: trim total SectionConcepts if necessary
-    max_concepts = _max_section_concepts_for_mode()
-    if max_concepts is not None and len(results) > max_concepts:
-        # Simple truncation preserves the natural order (by section),
-        # which is good enough for LIGHT mode.
-        results = results[:max_concepts]
-
-    return results
-
-
-
-def extract_concepts_from_document(
-    doc: "PaperDocument",
-    settings: Optional[Settings] = None,
-) -> List["SectionConcept"]:
-    """
-    Extract concepts from a PaperDocument, with behavior modulated by runtime_mode.
-
-    STANDARD (default):
-        - Process all sections (current behavior).
-
-    LIGHT:
-        - Focus on the most important sections (abstract, intro, related work, conclusion).
-        - If those can’t be identified, fall back to the first few sections.
-
-    HEAVY:
-        - For now, same as STANDARD. Later you might:
-            * increase candidate limits
-            * add extra passes (e.g., formula/concept extraction)
-    """
-    settings = settings or _settings
-    sections: Iterable["PaperSection"] = doc.sections
-
-    if settings.runtime_mode == RuntimeMode.LIGHT:
-        # Prefer sections whose kind or title matches the important set
-        filtered = [
-            s
-            for s in sections
-            if (
-                s.kind
-                and s.kind.lower() in _LIGHT_MODE_IMPORTANT_SECTIONS
-            ) or (
-                s.title
-                and s.title.lower() in _LIGHT_MODE_IMPORTANT_SECTIONS
-            )
-        ]
-
-        # Fallback: if nothing matched, keep just the first few sections
-        if filtered:
-            sections_to_use = filtered
-        else:
-            # doc.sections is likely a list; if not, cast to list
-            all_sections = list(doc.sections)
-            sections_to_use = all_sections[:3]
-    else:
-        # STANDARD and HEAVY both process all sections for now
-        sections_to_use = doc.sections
-
-    concepts: List["SectionConcept"] = []
-    for section in sections_to_use:
-        concepts.extend(extract_concepts_from_section(section))
-
-    return concepts
 
 
 @dataclass
@@ -385,13 +245,160 @@ class ConceptSummary:
     mentions_by_section: Dict[str, int] = field(default_factory=dict)
     weighted_score: float = 0.0
 
+
+# ---------------------------------------------------------------------------
+# Singleton extractor + low-level text API
+# ---------------------------------------------------------------------------
+
+@lru_cache(maxsize=1)
+def get_concept_extractor() -> ConceptExtractor:
+    """
+    Return a singleton ConceptExtractor.
+
+    Uses KEYBERT_MODEL_NAME from settings by default.
+    """
+    return ConceptExtractor(
+        model_name=settings.KEYBERT_MODEL_NAME,
+        default_top_n=settings.PAPER_TOP_CONCEPTS,
+    )
+
+
+def extract_concepts(
+    text: str,
+    top_n: Optional[int] = None,
+) -> List[Concept]:
+    """
+    Global convenience wrapper around the singleton ConceptExtractor.
+
+    Note: this is mode-agnostic. Runtime-aware behavior is applied in
+    section/document helpers below.
+    """
+    extractor = get_concept_extractor()
+    return extractor.extract_concepts(text, top_n=top_n)
+
+
+# ---------------------------------------------------------------------------
+# Section- / document-level concept extraction (runtime-aware)
+# ---------------------------------------------------------------------------
+
+def extract_concepts_from_section(
+    section: PaperSection,
+    paper_id: Optional[str] = None,
+) -> List[SectionConcept]:
+    """
+    Extract concepts from a single PaperSection and wrap them as SectionConcepts.
+
+    All runtime modes (LIGHT/STANDARD/HEAVY) perform extraction; LIGHT just
+    truncates overall counts at a higher level.
+    """
+    if not getattr(section, "text", None):
+        return []
+
+    text = section.text or ""
+    concepts = extract_concepts(text)
+
+    results: List[SectionConcept] = []
+    for c in concepts:
+        results.append(
+            SectionConcept(
+                concept=c,
+                paper_id=paper_id,
+                section_title=getattr(section, "title", None) or None,
+                section_level=getattr(section, "level", None),
+            )
+        )
+
+    return results
+
+
+def extract_concepts_from_sections(
+    sections: Sequence[PaperSection],
+    paper_id: Optional[str] = None,
+) -> List[SectionConcept]:
+    """
+    Run concept extraction over each PaperSection.
+
+    Runtime-aware behavior:
+      - LIGHT   → run extraction but truncate total SectionConcepts to a cap.
+      - STANDARD / HEAVY → full behavior.
+    """
+    results: List[SectionConcept] = []
+
+    for sec in sections:
+        results.extend(extract_concepts_from_section(sec, paper_id=paper_id))
+
+    # LIGHT mode: trim total SectionConcepts if necessary
+    max_concepts = _max_section_concepts_for_mode()
+    if max_concepts is not None and len(results) > max_concepts:
+        # Simple truncation preserves natural order (by section)
+        results = results[:max_concepts]
+
+    return results
+
+
+def extract_concepts_from_document(
+    doc: PaperDocument,
+    config: Optional[Settings] = None,
+) -> List[SectionConcept]:
+    """
+    Extract concepts from a PaperDocument, with behavior modulated by runtime_mode.
+
+    STANDARD (default):
+        - Process all sections.
+
+    LIGHT:
+        - Focus on the most important sections (abstract, intro, related work, conclusion).
+        - If those can’t be identified, fall back to the first few sections.
+
+    HEAVY:
+        - For now, same as STANDARD. Later you might:
+            * increase candidate limits
+            * add extra passes (e.g., formula/concept extraction).
+    """
+    config = config or settings
+    sections: Iterable[PaperSection] = doc.sections
+
+    if config.runtime_mode == RuntimeMode.LIGHT:
+        filtered = [
+            s
+            for s in sections
+            if (
+                getattr(s, "kind", None)
+                and s.kind.lower() in _LIGHT_MODE_IMPORTANT_SECTIONS
+            ) or (
+                getattr(s, "title", None)
+                and s.title.lower() in _LIGHT_MODE_IMPORTANT_SECTIONS
+            )
+        ]
+
+        if filtered:
+            sections_to_use = filtered
+        else:
+            all_sections = list(doc.sections)
+            sections_to_use = all_sections[:3]
+    else:
+        # STANDARD and HEAVY both process all sections for now
+        sections_to_use = list(doc.sections)
+
+    concepts: List[SectionConcept] = []
+    for section in sections_to_use:
+        concepts.extend(extract_concepts_from_section(section, paper_id=getattr(doc, "paper_id", None)))
+
+    max_concepts = _max_section_concepts_for_mode()
+    if max_concepts is not None and len(concepts) > max_concepts:
+        concepts = concepts[:max_concepts]
+
+    return concepts
+
+
+# ---------------------------------------------------------------------------
+# Aggregation: SectionConcept -> ConceptSummary
+# ---------------------------------------------------------------------------
+
 def _default_section_weights() -> Dict[str, float]:
     """
     Default heuristic weights per section title (case-insensitive).
-
-    You can override these in aggregate_section_concepts if needed.
     """
-    # These are normalized by lowercase and simple substring checks.
     return {
         "introduction": 0.5,
         "background": 0.7,
@@ -423,12 +430,9 @@ def _lookup_section_weight(
 
     title = section_title.lower()
 
-    # First, try exact normalized keys
     if title in weights:
         return weights[title]
 
-    # Otherwise, use substring matches (e.g., "introduction and overview")
-    # We keep it simple and deterministic: first match wins, based on insertion order.
     for key, w in weights.items():
         if key in title:
             return w
@@ -437,7 +441,7 @@ def _lookup_section_weight(
 
 
 def aggregate_section_concepts(
-    section_concepts: Sequence["SectionConcept"],
+    section_concepts: Sequence[SectionConcept],
     section_weights: Optional[Mapping[str, float]] = None,
     default_section_weight: float = 1.0,
 ) -> Dict[str, ConceptSummary]:
@@ -446,37 +450,30 @@ def aggregate_section_concepts(
 
     Returns:
         A dict mapping concept_key -> ConceptSummary.
-
-    Notes:
-        - concept_key defaults to concept.name if available, otherwise str(concept).
-        - If your Concept dataclass has a 'kind' attribute, it is used; otherwise None.
-        - weighted_score = sum_over_mentions(section_weight_for_that_section).
     """
     if section_weights is None:
         section_weights = _default_section_weights()
 
-    # concept_key -> (base_name, kind, total_count, dict[section_title] -> count, weighted_score)
     aggregates: Dict[str, Tuple[str, Optional[str], int, Dict[str, int], float]] = {}
 
     for sc in section_concepts:
         concept = sc.concept
 
-        # Try to be robust to whatever your existing Concept dataclass looks like
-        name = getattr(concept, "name", None) or str(concept)
+        name = getattr(concept, "name", None) or getattr(concept, "label", None) or str(concept)
         kind = getattr(concept, "kind", None)
 
-        concept_key = name  # you can later change this to (name, kind) if needed
+        concept_key = name
 
         section_title = sc.section_title or "UNKNOWN"
         weight = _lookup_section_weight(section_title, section_weights, default_section_weight)
 
         if concept_key not in aggregates:
             aggregates[concept_key] = (
-                name,            # base_name
-                kind,            # kind
-                0,               # total_count
-                defaultdict(int),# mentions_by_section
-                0.0,             # weighted_score
+                name,             # base_name
+                kind,             # kind
+                0,                # total_count
+                defaultdict(int), # mentions_by_section
+                0.0,              # weighted_score
             )
 
         base_name, concept_kind, total, per_section, weighted_score = aggregates[concept_key]
@@ -487,7 +484,6 @@ def aggregate_section_concepts(
 
         aggregates[concept_key] = (base_name, concept_kind, total, per_section, weighted_score)
 
-    # Convert into ConceptSummary objects
     summaries: Dict[str, ConceptSummary] = {}
     for key, (base_name, concept_kind, total, per_section, weighted_score) in aggregates.items():
         summaries[key] = ConceptSummary(
@@ -500,21 +496,3 @@ def aggregate_section_concepts(
         )
 
     return summaries
-
-
-# ----------------------------------------------------------------------
-# Singleton accessor used by the rest of the codebase
-# ----------------------------------------------------------------------
-
-
-@lru_cache(maxsize=1)
-def get_concept_extractor() -> ConceptExtractor:
-    """
-    Return a singleton ConceptExtractor.
-
-    Uses KEYBERT_MODEL_NAME from settings by default.
-    """
-    return ConceptExtractor(
-        model_name=settings.KEYBERT_MODEL_NAME,
-        default_top_n=settings.PAPER_TOP_CONCEPTS,
-    )
