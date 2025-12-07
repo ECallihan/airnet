@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     """
     Global configuration for the project.
 
-    Uses pydantic-settings to parse from env vars / .env.
+    Uses pydantic-settings to parse from environment variables and .env.
     """
 
     model_config = SettingsConfigDict(
@@ -47,7 +47,10 @@ class Settings(BaseSettings):
 
     KEYBERT_MODEL_NAME: str = Field(
         default="all-MiniLM-L6-v2",
-        description="SentenceTransformer model name used by KeyBERT for concept extraction.",
+        description=(
+            "SentenceTransformer model name used by KeyBERT for concept extraction. "
+            "Usually the same as SENTENCE_MODEL_NAME."
+        ),
     )
 
     SECTION_TOP_CONCEPTS: int = Field(
@@ -62,10 +65,21 @@ class Settings(BaseSettings):
 
     MAX_SECTION_CHARS: int = Field(
         default=4000,
-        description="Maximum number of characters from a section to send into KeyBERT to avoid overly long inputs.",
+        description=(
+            "Maximum number of characters from a section to send into KeyBERT "
+            "to avoid overly long inputs."
+        ),
     )
 
-    # You can add more NLP knobs later if needed, e.g. EMBED_BATCH_SIZE, MIN_CONCEPT_WEIGHT, etc.
+    EMBEDDING_DEVICE: str = Field(
+        default="auto",
+        description="Device for embedding model: 'auto', 'cpu', or 'cuda'.",
+    )
+
+    EMBEDDING_BATCH_SIZE: int = Field(
+        default=32,
+        description="Batch size for embedding computation.",
+    )
 
     # ------------------------------------------------------------------
     # Graph / API
@@ -114,15 +128,21 @@ _settings: Optional[Settings] = None
 
 
 def get_settings() -> Settings:
+    """
+    Singleton-style accessor so we only construct Settings once and
+    ensure directories exist on first access.
+    """
     global _settings
     if _settings is None:
         _settings = Settings()
+
         _settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
         _settings.raw_papers_dir.mkdir(parents=True, exist_ok=True)
         _settings.raw_metadata_dir.mkdir(parents=True, exist_ok=True)
         _settings.parsed_dir.mkdir(parents=True, exist_ok=True)
         _settings.enriched_dir.mkdir(parents=True, exist_ok=True)
         _settings.graph_dir.mkdir(parents=True, exist_ok=True)
+
     return _settings
 
 

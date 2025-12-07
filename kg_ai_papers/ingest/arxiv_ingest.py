@@ -2,74 +2,121 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict
-from pathlib import Path
+from dataclasses import dataclass
 from typing import List, Optional
 
-import json
-import arxiv
+import feedparser
 import requests
 
 from kg_ai_papers.config.settings import settings
 from kg_ai_papers.models.paper import Paper
 
 
-def _fetch_single_result(arxiv_id: str) -> Optional[arxiv.Result]:
-    search = arxiv.Search(
-        query=f"id:{arxiv_id}",
-        max_results=1,
-    )
-    for result in search.results():
-        return result
-    return None
+ARXIV_API_URL = "http://export.arxiv.org/api/query?search_query=id:{id}&max_results=1"
 
 
-def _download_pdf(pdf_url: str, dest_path: Path, overwrite: bool = False) -> Path:
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    if dest_path.exists() and not overwrite:
-        return dest_path
+@dataclass
+class ArxivMetadata:
+    arxiv_id: str          # including version, e.g. "1706.03762v7"
+    title: str
+    summary: str
+    pdf_url: str
 
-    resp = requests.get(pdf_url, timeout=60)
+
+def _fetch_arxiv_metadata(arxiv_id: str) -> Optional[ArxivMetadata]:
+    """
+    Call the arXiv API for a single id and return minimal metadata.
+
+    arxiv_id can be with or without version ("1706.03762" or "1706.03762v7").
+    """
+    url = ARXIV_API_URL.format(id=arxiv_id)
+    resp = requests.get(url, timeout=30)
     resp.raise_for_status()
-    dest_path.write_bytes(resp.content)
-    return dest_path
+
+    feed = feedparser.parse(resp.text)
+    if not feed.entries:
+        return None
+
+    entry = feed.entries[0]
+
+    # entry.id is like "http://arxiv.org/abs/1706.03762v7"
+    full_id = entry.id.rsplit("/", 1)[-1]  # "1706.03762v7"
+
+    title = entry.title.strip()
+    summary = getattr(entry, "summary", "").strip()
+
+    # Find pdf link if present, else construct it
+    pdf_url = None
+    for link in getattr(entry, "links", []):
+        if link.get("type") == "application/pdf":
+            pdf_url = link.get("href")
+            break
+
+    if pdf_url is None:
+        pdf_url = f"https://arxiv.org/pdf/{full_id}.pdf"
+
+    return ArxivMetadata(
+        arxiv_id=full_id,
+        title=title,
+        summary=summary,
+        pdf_url=pdf_url,
+    )
 
 
-def fetch_papers_and_pdfs(
+def _download_pdf(meta: ArxivMetadata, overwrite: bool = False) -> str:
+    """
+    Download the PDF to data/raw/papers/{arxiv_id}.pdf and return the local path.
+    """
+    settings.raw_papers_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = settings.raw_papers_dir / f"{meta.arxiv_id}.pdf"
+
+    if pdf_path.exists() and not overwrite:
+        return str(pdf_path)
+
+    resp = requests.get(meta.pdf_url, timeout=120)
+    resp.raise_for_status()
+
+    with pdf_path.open("wb") as f:
+        f.write(resp.content)
+
+    return str(pdf_path)
+
+
+def ingest_arxiv_ids(
     arxiv_ids: List[str],
     overwrite_pdfs: bool = False,
 ) -> List[Paper]:
     """
-    Fetch metadata + PDFs for a list of arXiv IDs and return a list of Paper objects.
+    High-level ingestion function used by the pipeline.
 
-    - PDFs are stored in settings.raw_papers_dir / {arxiv_id}.pdf
-    - Metadata JSON is stored in settings.raw_metadata_dir / {arxiv_id}.json
+    For each arXiv id:
+      - fetch metadata
+      - download PDF
+      - build a Paper object with arxiv_id (with version), title, abstract, pdf_path
+
+    Returns:
+      List[Paper]
     """
     papers: List[Paper] = []
 
-    for aid in arxiv_ids:
-        result = _fetch_single_result(aid)
-        if result is None:
-            print(f"[WARN] No arXiv result found for {aid}, skipping.")
+    for raw_id in arxiv_ids:
+        meta = _fetch_arxiv_metadata(raw_id)
+        if meta is None:
+            print(f"[WARN] No arXiv entry found for {raw_id!r}, skipping.")
             continue
 
-        pdf_path = settings.raw_papers_dir / f"{result.get_short_id()}.pdf"
-        print(f"[INGEST] Downloading PDF for {aid} -> {pdf_path}")
-        _download_pdf(result.pdf_url, pdf_path, overwrite=overwrite_pdfs)
+        try:
+            pdf_path = _download_pdf(meta, overwrite=overwrite_pdfs)
+        except Exception as e:
+            print(f"[WARN] Failed to download PDF for {meta.arxiv_id}: {e}")
+            pdf_path = ""
 
         paper = Paper(
-            arxiv_id=result.get_short_id(),
-            title=result.title,
-            abstract=result.summary,
-            pdf_path=str(pdf_path),
+            arxiv_id=meta.arxiv_id,
+            title=meta.title,
+            abstract=meta.summary,
+            pdf_path=pdf_path,
         )
-
-        # Save minimal metadata JSON
-        meta_path = settings.raw_metadata_dir / f"{paper.arxiv_id}.json"
-        meta_path.parent.mkdir(parents=True, exist_ok=True)
-        with meta_path.open("w", encoding="utf-8") as f:
-            json.dump(asdict(paper), f, indent=2, ensure_ascii=False)
-
         papers.append(paper)
 
     return papers

@@ -2,243 +2,119 @@
 
 from __future__ import annotations
 
-from typing import List, Iterable, Optional
-from functools import lru_cache
+from typing import List, Optional
 
 import numpy as np
+import torch
 from sentence_transformers import SentenceTransformer
-
-try:
-    import torch
-except ImportError:  # pragma: no cover - torch optional
-    torch = None
 
 from kg_ai_papers.config.settings import settings
 from kg_ai_papers.models.paper import Paper
-from kg_ai_papers.models.section import Section
 
 
 class EmbeddingModel:
     """
-    Thin wrapper around SentenceTransformer for:
-      - text embeddings
-      - paper-level embeddings (title + abstract + sections)
-      - concept label embeddings
-
-    Keeps a single underlying model instance (per process),
-    and lets you choose device (CPU / CUDA) if available.
+    Thin wrapper around SentenceTransformer that exposes higher-level helpers
+    like encode_paper and similarity, as expected by the tests.
     """
 
-    def __init__(self, model_name: str, device: Optional[str] = None):
+    def __init__(self, model: SentenceTransformer):
+        self._model = model
+
+    # --------- low-level helpers ---------
+
+    def encode_texts(self, texts: List[str]) -> List[List[float]]:
+        batch_size = max(1, settings.EMBEDDING_BATCH_SIZE)
+        all_embeddings: List[List[float]] = []
+
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            emb = self._model.encode(
+                batch,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=True,
+            )
+            all_embeddings.extend(emb.tolist())
+
+        return all_embeddings
+
+    def encode_text(self, text: str) -> List[float]:
+        return self.encode_texts([text])[0]
+
+    # --------- paper-level helper ---------
+
+    def encode_paper(self, paper: Paper) -> List[float]:
         """
-        :param model_name: SentenceTransformer model name.
-        :param device: "cpu", "cuda", or None to auto-detect.
+        Encode a Paper using its title + abstract.
         """
-        if device is None:
-            device = self._auto_device()
-        self.device = device
-
-        self._model = SentenceTransformer(model_name, device=self.device)
-
-    # ------------------------------------------------------------------
-    # Device selection
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _auto_device() -> str:
-        """
-        Simple heuristic:
-          - If torch with CUDA is available, use "cuda"
-          - Else fallback to "cpu"
-        """
-        if torch is not None and torch.cuda.is_available():
-            return "cuda"
-        return "cpu"
-
-    # ------------------------------------------------------------------
-    # Core encoding helpers
-    # ------------------------------------------------------------------
-
-    def encode_text(
-        self,
-        text: str,
-        normalize: bool = True,
-        convert_to_tensor: bool = True,
-    ):
-        """
-        Encode a single text string.
-        Returns a torch.Tensor by default (good for cosine similarity).
-        """
-        if not text:
-            text = ""
-
-        emb = self._model.encode(
-            text,
-            convert_to_tensor=convert_to_tensor,
-            normalize_embeddings=normalize,
-        )
-        return emb
-
-    def encode_texts(
-        self,
-        texts: Iterable[str],
-        normalize: bool = True,
-        convert_to_tensor: bool = True,
-        batch_size: int = 32,
-    ):
-        """
-        Encode a batch of texts more efficiently than looping.
-        Returns either a torch.Tensor or np.ndarray depending on convert_to_tensor.
-        """
-        texts_list = list(texts)
-        if not texts_list:
-            return []
-
-        embs = self._model.encode(
-            texts_list,
-            batch_size=batch_size,
-            convert_to_tensor=convert_to_tensor,
-            normalize_embeddings=normalize,
-            show_progress_bar=False,
-        )
-        return embs
-
-    # ------------------------------------------------------------------
-    # Concept embeddings
-    # ------------------------------------------------------------------
-
-    def encode_concept_label(
-        self,
-        label: str,
-        normalize: bool = True,
-        convert_to_tensor: bool = True,
-    ):
-        """
-        Encode a concept label (e.g., "graph neural networks").
-        """
-        return self.encode_text(
-            label,
-            normalize=normalize,
-            convert_to_tensor=convert_to_tensor,
-        )
-
-    # ------------------------------------------------------------------
-    # Paper-level embeddings
-    # ------------------------------------------------------------------
-
-    def _build_paper_text(
-        self,
-        paper: Paper,
-        max_chars: int = 8000,
-        include_sections: bool = True,
-        max_sections: int = 5,
-    ) -> str:
-        """
-        Build a representative text for a paper:
-          - title
-          - abstract
-          - first few sections (if available)
-        Truncate to max_chars to avoid huge inputs.
-        """
-        parts: List[str] = []
-
-        if paper.title:
-            parts.append(paper.title)
-
+        parts = [paper.title or ""]
         if paper.abstract:
             parts.append(paper.abstract)
+        text = "\n\n".join(parts).strip()
+        if not text:
+            # Degenerate case: no text; return a zero vector of some reasonable size
+            # We can just encode an empty string to get the right dimensionality.
+            text = ""
+        return self.encode_text(text)
 
-        if include_sections and paper.sections:
-            # Take first N sections (often Intro, Background, etc.)
-            for section in paper.sections[:max_sections]:
-                if section.title:
-                    parts.append(section.title)
-                if section.text:
-                    parts.append(section.text)
+    # --------- similarity helper ---------
 
-        full_text = "\n\n".join(parts)
-        return full_text[:max_chars]
-
-    def encode_paper(
-        self,
-        paper: Paper,
-        normalize: bool = True,
-        convert_to_tensor: bool = True,
-        include_sections: bool = True,
-        max_sections: int = 5,
-        max_chars: int = 8000,
-    ):
+    def similarity(self, v1, v2) -> float:
         """
-        Encode a paper as a single embedding.
+        Cosine similarity between two vectors (lists, numpy arrays, or tensors).
         """
-        text = self._build_paper_text(
-            paper=paper,
-            max_chars=max_chars,
-            include_sections=include_sections,
-            max_sections=max_sections,
-        )
-        emb = self.encode_text(
-            text,
-            normalize=normalize,
-            convert_to_tensor=convert_to_tensor,
-        )
-        return emb
-
-    def encode_papers_batch(
-        self,
-        papers: List[Paper],
-        normalize: bool = True,
-        convert_to_tensor: bool = True,
-        include_sections: bool = True,
-        max_sections: int = 5,
-        max_chars: int = 8000,
-        batch_size: int = 16,
-    ):
-        """
-        Efficiently encode a batch of papers.
-        Returns an array/tensor of embeddings and also sets paper.embedding.
-        """
-        if not papers:
-            return []
-
-        texts = [
-            self._build_paper_text(
-                paper=p,
-                max_chars=max_chars,
-                include_sections=include_sections,
-                max_sections=max_sections,
-            )
-            for p in papers
-        ]
-
-        embs = self._model.encode(
-            texts,
-            batch_size=batch_size,
-            convert_to_tensor=convert_to_tensor,
-            normalize_embeddings=normalize,
-            show_progress_bar=False,
-        )
-
-        # Attach embeddings back to papers
-        if convert_to_tensor:
-            # embs is usually a single 2D torch.Tensor
-            for i, p in enumerate(papers):
-                p.embedding = embs[i]
-        else:
-            # embs is a np.ndarray
-            for i, p in enumerate(papers):
-                p.embedding = embs[i, :]
-
-        return embs
+        v1_arr = np.asarray(v1, dtype=float)
+        v2_arr = np.asarray(v2, dtype=float)
+        denom = (np.linalg.norm(v1_arr) * np.linalg.norm(v2_arr)) + 1e-8
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(v1_arr, v2_arr) / denom)
 
 
-# ----------------------------------------------------------------------
-# Singleton accessor
-# ----------------------------------------------------------------------
+_backend: Optional[EmbeddingModel] = None
 
-@lru_cache(maxsize=1)
+
+def _make_sentence_model() -> SentenceTransformer:
+    """
+    Construct the underlying SentenceTransformer on the appropriate device.
+    """
+    if settings.EMBEDDING_DEVICE == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = settings.EMBEDDING_DEVICE
+
+    return SentenceTransformer(settings.SENTENCE_MODEL_NAME, device=device)
+
+
 def get_embedding_model() -> EmbeddingModel:
     """
-    Cached EmbeddingModel instance using the model name from settings.
+    Return a singleton EmbeddingModel, as expected by tests.
     """
-    return EmbeddingModel(model_name=settings.SENTENCE_MODEL_NAME)
+    global _backend
+    if _backend is not None:
+        return _backend
+
+    st_model = _make_sentence_model()
+    _backend = EmbeddingModel(st_model)
+    return _backend
+
+
+# ---------------------------------------------------------------------------
+# Convenience functions used by the pipeline
+# ---------------------------------------------------------------------------
+
+def embed_texts(texts: List[str]) -> List[List[float]]:
+    """
+    Embed a batch of texts and return a list of embedding vectors (as Python lists).
+    """
+    backend = get_embedding_model()
+    return backend.encode_texts(texts)
+
+
+def embed_text(text: str) -> List[float]:
+    """
+    Convenience wrapper for a single text.
+    """
+    backend = get_embedding_model()
+    return backend.encode_text(text)
