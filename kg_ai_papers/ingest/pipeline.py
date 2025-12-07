@@ -14,6 +14,22 @@ from kg_ai_papers.nlp.concept_extraction import (
     extract_concepts_from_sections,
     aggregate_section_concepts,
 )
+from kg_ai_papers.models.paper import Paper
+
+
+@dataclass
+class IngestedPaperResult:
+    """
+    Bundle the key outputs of ingestion for downstream consumers:
+
+    - paper: core metadata (arxiv_id, title, abstract, year, etc.)
+    - concept_summaries: aggregated concept scores for this paper
+    - references: list of arxiv_ids this paper cites (outgoing edges)
+      (currently optional / empty until citation extraction is wired in)
+    """
+    paper: Paper
+    concept_summaries: Dict[str, ConceptSummary]
+    references: List[str]
 
 
 @dataclass
@@ -164,3 +180,85 @@ def persist_ingested_paper_to_neo4j(session: Any, ingested: IngestedPaper) -> No
         arxiv_id=ingested.paper_id,
         concepts=concepts_param,
     )
+
+
+# --- Optional convenience: ingest + update NetworkX graph --------------------
+
+
+def ingest_pdf_and_update_graph(
+    G: "Any",  # typically nx.MultiDiGraph; kept loose to avoid hard dependency here
+    pdf_path: Path,
+    *,
+    grobid_client: GrobidClient,
+    neo4j_session: Optional[Any] = None,
+    paper: Optional[Paper] = None,
+    paper_id: Optional[str] = None,
+    references: Optional[List[str]] = None,
+) -> IngestedPaperResult:
+    """
+    Convenience helper: ingest a PDF, optionally persist to Neo4j, update the
+    in-memory NetworkX graph, and return a high-level IngestedPaperResult.
+
+    Parameters
+    ----------
+    G:
+        A NetworkX MultiDiGraph (or compatible) representing the in-memory KG.
+    pdf_path:
+        Path to the input PDF.
+    grobid_client:
+        Grobid client instance used by `grobid_client.process_pdf`.
+    neo4j_session:
+        Optional Neo4j session; passed through to `ingest_pdf`.
+    paper:
+        Optional pre-built Paper model. If provided, its `arxiv_id` drives
+        the paper_id used throughout.
+    paper_id:
+        Optional explicit paper_id / arxiv_id. If both `paper` and `paper_id`
+        are None, we fall back to `pdf_path.stem`.
+    references:
+        Optional list of arxiv_ids this paper cites. For now this usually
+        remains empty until citation extraction is wired in.
+
+    Returns
+    -------
+    IngestedPaperResult
+        High-level bundle with Paper + concept summaries + references.
+    """
+    # Resolve the canonical id we will use everywhere
+    if paper is not None:
+        resolved_id = paper.arxiv_id
+    elif paper_id is not None:
+        resolved_id = paper_id
+    else:
+        resolved_id = pdf_path.stem
+
+    # Run the core ingestion (PDF → TEI → sections → concepts [+ Neo4j])
+    ingested = ingest_pdf(
+        pdf_path,
+        paper_id=resolved_id,
+        grobid_client=grobid_client,
+        neo4j_session=neo4j_session,
+    )
+
+    # If the caller didn't provide a Paper model, create a minimal placeholder.
+    if paper is None:
+        paper = Paper(arxiv_id=resolved_id)
+
+    # References are currently optional / placeholder until TEI citation
+    # extraction or arXiv metadata wiring is added.
+    if references is None:
+        references = []
+
+    result = IngestedPaperResult(
+        paper=paper,
+        concept_summaries=ingested.concept_summaries,
+        references=references,
+    )
+
+    # Update the in-memory graph using the standard helper.
+    # Local import to avoid import-time cycles.
+    from kg_ai_papers.graph.builder import update_graph_with_ingested_paper
+
+    update_graph_with_ingested_paper(G, result)
+
+    return result

@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import networkx as nx
 import numpy as np
+from kg_ai_papers.ingest.pipeline import IngestedPaperResult
 
 from kg_ai_papers.nlp.concept_extraction import ConceptSummary
 from kg_ai_papers.graph.schema import EdgeType, NodeType
@@ -326,3 +327,140 @@ def get_paper_concept_edges(
 
     edge_dict = graph.get_edge_data(p_node, c_node) or {}
     return list(edge_dict.values())
+
+def update_graph_with_ingested_paper(
+    G: nx.MultiDiGraph,
+    result: IngestedPaperResult,
+) -> None:
+    """
+    Incrementally update an existing graph with the outputs from ingest_single_pdf.
+
+    - Ensures the paper node exists (with metadata).
+    - Attaches concept nodes + edges using existing ConceptSummary logic.
+    - Adds citation edges to any referenced papers (creating stub paper nodes if needed).
+    """
+    paper = result.paper
+    paper_id = paper_node_id(paper.arxiv_id)
+
+    # 1) Ensure the main paper node exists with up-to-date attributes
+    if paper_id not in G:
+        G.add_node(
+            paper_id,
+            kind="paper",
+            arxiv_id=paper.arxiv_id,
+            title=getattr(paper, "title", None),
+            year=getattr(paper, "year", None),
+            abstract=getattr(paper, "abstract", None),
+        )
+    else:
+        # Optionally update attributes if they were placeholders before
+        G.nodes[paper_id].update(
+            {
+                "title": getattr(paper, "title", None),
+                "year": getattr(paper, "year", None),
+                "abstract": getattr(paper, "abstract", None),
+            }
+        )
+
+    # 2) Attach concepts using your existing aggregation helper
+    #    (this expects {arxiv_id: Dict[str, ConceptSummary]})
+    from kg_ai_papers.graph.builder import attach_concepts_to_graph  # local import to avoid cycles
+
+    attach_concepts_to_graph(
+        G,
+        {paper.arxiv_id: result.concept_summaries},
+    )
+
+    # 3) Add citation edges for each reference
+    for ref_arxiv in result.references:
+        ref_id = paper_node_id(ref_arxiv)
+
+        if ref_id not in G:
+            # Create a stub node; we may enrich it later if that paper is ingested
+            G.add_node(
+                ref_id,
+                kind="paper",
+                arxiv_id=ref_arxiv,
+            )
+
+        # Edge: paper -> reference (paper cites ref)
+        G.add_edge(
+            paper_id,
+            ref_id,
+            key=f"cites:{paper.arxiv_id}->{ref_arxiv}",
+            kind="cites",
+            weight=1.0,
+        )
+
+def update_graph_with_ingested_paper(
+    graph: nx.MultiDiGraph,
+    result: "IngestedPaperResult",
+) -> nx.MultiDiGraph:
+    """
+    Merge a single IngestedPaperResult into an existing NetworkX graph.
+
+    This function bridges the ingestion pipeline and the graph layer:
+
+    - Ensures a *base* paper node exists (using the same schema as build_graph),
+      keyed by `paper.arxiv_id`.
+    - Attaches concept summaries via the concept-layer helpers
+      (paper_node_id / concept_node_id, MENTIONS_CONCEPT edges).
+    - Adds citation edges from the ingested paper to any referenced papers,
+      using the PAPER_CITES_PAPER edge type.
+
+    Parameters
+    ----------
+    graph:
+        The graph to mutate (nx.MultiDiGraph).
+    result:
+        An IngestedPaperResult (or any duck-typed object with
+        `.paper`, `.concept_summaries`, `.references` attributes).
+
+    Returns
+    -------
+    nx.MultiDiGraph
+        The same graph instance, for convenience.
+    """
+    # 1) Ensure the main paper node exists (unprefixed arxiv_id, same as build_graph)
+    paper = result.paper
+    paper_node = _get_or_create_paper_node(graph, paper)  # node id == paper.arxiv_id
+
+    # 2) Attach concept summaries using the concept-layer helpers
+    #    Here we treat the paper_id as the arxiv_id; this will create/attach
+    #    a "paper:{arxiv_id}" node in the concept subgraph.
+    if getattr(result, "concept_summaries", None):
+        add_concept_summaries_for_paper(
+            graph,
+            paper_id=paper.arxiv_id,
+            concept_summaries=result.concept_summaries,
+        )
+
+    # 3) Add citation edges for any references reported by ingestion
+    for cited_id in getattr(result, "references", []) or []:
+        if not cited_id:
+            continue
+
+        # Ensure the cited paper node exists in the *base* graph schema
+        if cited_id in graph:
+            cited_node = cited_id
+        else:
+            graph.add_node(
+                cited_id,
+                type=NodeType.PAPER.value,
+                arxiv_id=cited_id,
+                title="",
+                abstract="",
+            )
+            cited_node = cited_id
+
+        # For now we don't have embeddings here, so influence/similarity are 0.0
+        _ensure_edge(
+            graph,
+            paper_node,
+            cited_node,
+            EdgeType.PAPER_CITES_PAPER,
+            influence_score=0.0,
+            similarity=0.0,
+        )
+
+    return graph
