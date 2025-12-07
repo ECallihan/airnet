@@ -6,7 +6,7 @@ from functools import lru_cache
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Sequence, Tuple, Optional, Iterable
-from kg_ai_papers.config.settings import Settings, RuntimeMode
+from kg_ai_papers.config.settings import settings, Settings, RuntimeMode
 
 from kg_ai_papers.tei_parser import PaperSection
 from kg_ai_papers.documents import PaperDocument
@@ -30,6 +30,59 @@ _LIGHT_MODE_IMPORTANT_SECTIONS = {
     "summary",
 }
 
+# ---------------------------------------------------------------------------
+# Runtime-mode helpers for concept extraction
+# ---------------------------------------------------------------------------
+
+# How many concepts we allow per paper in each mode.
+# These are intentionally conservative so STANDARD behaves as before.
+_RUNTIME_MAX_CONCEPTS_STANDARD = 50
+_RUNTIME_MAX_CONCEPTS_LIGHT = 10
+
+
+def _should_extract_concepts() -> bool:
+    """
+    Returns False in OFF mode so we can bail out early.
+    """
+    return settings.runtime_mode != RuntimeMode.OFF
+
+
+def _max_concepts_for_mode() -> int:
+    """
+    Returns how many concepts to keep given the current runtime mode.
+    STANDARD uses a high cap so existing behavior is effectively unchanged.
+    """
+    if settings.runtime_mode == RuntimeMode.LIGHT:
+        return _RUNTIME_MAX_CONCEPTS_LIGHT
+    # STANDARD and any future modes default to a high cap.
+    return _RUNTIME_MAX_CONCEPTS_STANDARD
+
+# ---------------------------------------------------------------------------
+# Runtime-mode helpers for concept extraction
+# ---------------------------------------------------------------------------
+
+# Cap on how many section-level concept mentions we keep in LIGHT mode.
+# STANDARD mode effectively has no cap at this layer.
+_RUNTIME_MAX_SECTION_CONCEPTS_LIGHT = 50
+
+
+def _should_extract_concepts() -> bool:
+    """
+    OFF mode: skip concept extraction entirely.
+    LIGHT/STANDARD: allow extraction.
+    """
+    return settings.runtime_mode != RuntimeMode.OFF
+
+
+def _max_section_concepts_for_mode() -> Optional[int]:
+    """
+    Return a global cap on SectionConcept items produced by
+    extract_concepts_from_sections, or None for 'no cap'.
+    """
+    if settings.runtime_mode == RuntimeMode.LIGHT:
+        return _RUNTIME_MAX_SECTION_CONCEPTS_LIGHT
+    # STANDARD (and future heavier modes) get full detail.
+    return None
 
 class ConceptExtractor:
     """
@@ -212,10 +265,21 @@ def extract_concepts_from_sections(
     """
     Run the existing text-based concept extraction over each PaperSection.
 
+    Runtime-aware behavior:
+      - OFF     → return an empty list (skip heavy work entirely).
+      - LIGHT   → run full extraction but truncate the total number of
+                  SectionConcepts to a smaller cap.
+      - STANDARD (default) → behave as before, apart from the optional cap
+                             (which is effectively inactive for small inputs).
+
     This preserves your existing heuristics in extract_concepts(text),
     but enriches the results with section metadata so downstream
     influence modeling can weigh concepts differently by section.
     """
+    # OFF mode: skip concept extraction altogether
+    if not _should_extract_concepts():
+        return []
+
     results: List[SectionConcept] = []
 
     for sec in sections:
@@ -235,7 +299,15 @@ def extract_concepts_from_sections(
                 )
             )
 
+    # LIGHT mode: trim total SectionConcepts if necessary
+    max_concepts = _max_section_concepts_for_mode()
+    if max_concepts is not None and len(results) > max_concepts:
+        # Simple truncation preserves the natural order (by section),
+        # which is good enough for LIGHT mode.
+        results = results[:max_concepts]
+
     return results
+
 
 
 def extract_concepts_from_document(
