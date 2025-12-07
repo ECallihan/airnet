@@ -1,134 +1,110 @@
-# kg_ai_papers/nlp/embedding.py
-
 from __future__ import annotations
 
-from typing import List, Optional
+from functools import lru_cache
+from typing import Iterable, List, Optional
 
 import numpy as np
-import torch
-from sentence_transformers import SentenceTransformer
 
-from kg_ai_papers.config.settings import settings
-from kg_ai_papers.models.paper import Paper
-from kg_ai_papers.config.settings import Settings, RuntimeMode
+from kg_ai_papers.config.settings import RuntimeMode, get_settings
 
-_settings = Settings()
+try:
+    # sentence-transformers is expected in normal / full runs
+    from sentence_transformers import SentenceTransformer
+except ImportError:  # pragma: no cover - only hit in very minimal installs
+    SentenceTransformer = None  # type: ignore[misc]
 
-_DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # or whatever you had
-_MODEL_NAME = _settings.embedding_model_name or _DEFAULT_MODEL
 
-_model: SentenceTransformer = SentenceTransformer(_MODEL_NAME)
-
-class EmbeddingModel:
+class DummyEmbeddingModel:
     """
-    Thin wrapper around SentenceTransformer that exposes higher-level helpers
-    like encode_paper and similarity, as expected by the tests.
+    Cheap fallback embedding model used when enable_embeddings=False.
+
+    It produces deterministic pseudo-embeddings based on Python's hash(),
+    just to keep shapes and basic similarity behavior consistent for
+    downstream code. This is *not* semantically meaningful, but it lets
+    the rest of the pipeline run on extremely constrained machines.
     """
 
-    def __init__(self, model: SentenceTransformer):
-        self._model = model
+    def __init__(self, dim: int = 64) -> None:
+        self.dim = dim
 
-    # --------- low-level helpers ---------
+    def encode(
+        self,
+        sentences: Iterable[str],
+        batch_size: int = 32,
+        convert_to_numpy: bool = True,
+        **_: object,
+    ):
+        vecs: List[np.ndarray] = []
+        for text in sentences:
+            h = hash(text)
+            rng = np.random.default_rng(h & 0xFFFFFFFF)
+            v = rng.standard_normal(self.dim).astype("float32")
+            vecs.append(v)
 
-    def encode_texts(self, texts: List[str]) -> List[List[float]]:
-        batch_size = max(1, settings.EMBEDDING_BATCH_SIZE)
-        all_embeddings: List[List[float]] = []
-
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
-            emb = self._model.encode(
-                batch,
-                show_progress_bar=False,
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            )
-            all_embeddings.extend(emb.tolist())
-
-        return all_embeddings
-
-    def encode_text(self, text: str) -> List[float]:
-        return self.encode_texts([text])[0]
-
-    # --------- paper-level helper ---------
-
-    def encode_paper(self, paper: Paper) -> List[float]:
-        """
-        Encode a Paper using its title + abstract.
-        """
-        parts = [paper.title or ""]
-        if paper.abstract:
-            parts.append(paper.abstract)
-        text = "\n\n".join(parts).strip()
-        if not text:
-            # Degenerate case: no text; return a zero vector of some reasonable size
-            # We can just encode an empty string to get the right dimensionality.
-            text = ""
-        return self.encode_text(text)
-
-    # --------- similarity helper ---------
-
-    def similarity(self, v1, v2) -> float:
-        """
-        Cosine similarity between two vectors (lists, numpy arrays, or tensors).
-        """
-        v1_arr = np.asarray(v1, dtype=float)
-        v2_arr = np.asarray(v2, dtype=float)
-        denom = (np.linalg.norm(v1_arr) * np.linalg.norm(v2_arr)) + 1e-8
-        if denom == 0.0:
-            return 0.0
-        return float(np.dot(v1_arr, v2_arr) / denom)
+        arr = np.stack(vecs, axis=0)
+        if convert_to_numpy:
+            return arr
+        return arr  # simple; callers in our codebase expect numpy anyway
 
 
-_backend: Optional[EmbeddingModel] = None
+@lru_cache(maxsize=1)
+def _get_settings():
+    # Cached so that multiple embedding calls don’t rebuild Settings.
+    return get_settings()
 
 
-def _make_sentence_model() -> SentenceTransformer:
+@lru_cache(maxsize=1)
+def get_embedding_model():
     """
-    Construct the underlying SentenceTransformer on the appropriate device.
+    Returns a singleton embedding model instance.
+
+    Behavior:
+    - If settings.enable_embeddings is False -> DummyEmbeddingModel
+    - Else -> SentenceTransformer model using
+        - settings.embedding_model_name (if set) or
+        - settings.SENTENCE_MODEL_NAME
     """
-    if settings.EMBEDDING_DEVICE == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    else:
-        device = settings.EMBEDDING_DEVICE
+    settings = _get_settings()
 
-    return SentenceTransformer(settings.SENTENCE_MODEL_NAME, device=device)
+    # Lightest possible mode: no real embeddings, just deterministic noise
+    if not settings.enable_embeddings:
+        return DummyEmbeddingModel()
+
+    if SentenceTransformer is None:
+        raise RuntimeError(
+            "sentence-transformers is required when enable_embeddings=True. "
+            "Either install it or set AIRNET_ENABLE_EMBEDDINGS=false."
+        )
+
+    model_name = settings.embedding_model_name or settings.SENTENCE_MODEL_NAME
+
+    # NOTE: we let SentenceTransformer choose device by default.
+    # If you later want to do more device-aware logic, we can
+    # also inspect settings.runtime_mode and settings.EMBEDDING_DEVICE here.
+    model = SentenceTransformer(model_name)
+    return model
 
 
-def get_embedding_model() -> EmbeddingModel:
+def embed_texts(texts: Iterable[str]):
     """
-    Return a singleton EmbeddingModel, as expected by tests.
+    Convenience wrapper that encodes a list/iterable of texts into
+    a 2D numpy array of embeddings.
+
+    This is where runtime_mode actually kicks in via
+    settings.embedding_batch_size, which selects a batch size based
+    on LIGHT / STANDARD / HEAVY.
     """
-    global _backend
-    if _backend is not None:
-        return _backend
+    settings = _get_settings()
+    model = get_embedding_model()
 
-    st_model = _make_sentence_model()
-    _backend = EmbeddingModel(st_model)
-    return _backend
+    batch_size = settings.embedding_batch_size
+    # For reference:
+    # - LIGHT   -> embedding_batch_size_light (e.g. 8)
+    # - STANDARD-> embedding_batch_size_standard (e.g. 32)
+    # - HEAVY   -> embedding_batch_size_heavy (e.g. 128)
 
-
-# ---------------------------------------------------------------------------
-# Convenience functions used by the pipeline
-# ---------------------------------------------------------------------------
-
-def embed_texts(texts: List[str]) -> List[List[float]]:
-    """
-    Embed a list of texts, respecting Settings.enable_embeddings and runtime_mode.
-    """
-    if not _settings.enable_embeddings:
-        # Very cheap fallback: return a trivial representation
-        # so that code paths don’t break. You can make this smarter later.
-        return [[0.0] * 3 for _ in texts]
-
-    batch_size = _settings.embedding_batch_size
-    # You can use batch_size in encode if you want:
-    # return _model.encode(texts, batch_size=batch_size, convert_to_numpy=False)
-    return _model.encode(texts, convert_to_numpy=False)
-
-
-def embed_text(text: str) -> List[float]:
-    """
-    Convenience wrapper for a single text.
-    """
-    backend = get_embedding_model()
-    return backend.encode_text(text)
+    return model.encode(
+        list(texts),
+        batch_size=batch_size,
+        convert_to_numpy=True,
+    )

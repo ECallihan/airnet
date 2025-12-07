@@ -7,8 +7,7 @@ import os
 from pathlib import Path
 from typing import Optional
 import httpx
-from kg_ai_papers.config.settings import Settings
-_settings = Settings()
+from kg_ai_papers.config.settings import get_settings
 
 import requests
 
@@ -18,11 +17,17 @@ class GrobidClientError(Exception):
 
 
 class GrobidClient:
-    def __init__(self, base_url: str, max_concurrent: Optional[int] = None) -> None:
-        self.base_url = base_url
-        self._max_concurrent = max_concurrent or _settings.grobid_max_concurrent_requests
-        self._sem = asyncio.Semaphore(self._max_concurrent)
-        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=60.0)
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        timeout: float = 30.0,
+        session: Optional[requests.Session] = None,
+    ) -> None:
+        settings = get_settings()
+        # If not explicitly provided, fall back to config
+        self.base_url = base_url or settings.GROBID_URL
+        self.timeout = timeout
+        self.session = session or requests.Session()
 
     async def process_fulltext(self, pdf_bytes: bytes) -> str:
         async with self._sem:
