@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import List, Optional
+from collections import defaultdict
+from dataclasses import dataclass, field
+from typing import Dict, List, Mapping, Sequence, Tuple, Optional
 
+from kg_ai_papers.tei_parser import PaperSection
+from kg_ai_papers.documents import PaperDocument
+from dataclasses import dataclass
 from keybert import KeyBERT
 
 from kg_ai_papers.config.settings import settings
@@ -169,6 +174,198 @@ class ConceptExtractor:
             section_top_n=settings.SECTION_TOP_CONCEPTS,
             paper_top_n=settings.PAPER_TOP_CONCEPTS,
         )
+
+@dataclass
+class SectionConcept:
+    """
+    A concept mention tied to a specific paper section.
+
+    Attributes:
+        concept: The underlying Concept object (name, kind, etc.).
+        paper_id: ID of the paper this concept comes from.
+        section_title: Title of the section (e.g. "Introduction", "Methods").
+        section_level: Section nesting level (1 = top-level, if available).
+    """
+    concept: "Concept"
+    paper_id: Optional[str] = None
+    section_title: Optional[str] = None
+    section_level: Optional[int] = None
+
+def extract_concepts_from_sections(
+    sections: Sequence[PaperSection],
+    paper_id: Optional[str] = None,
+) -> List[SectionConcept]:
+    """
+    Run the existing text-based concept extraction over each PaperSection.
+
+    This preserves your existing heuristics in extract_concepts(text),
+    but enriches the results with section metadata so downstream
+    influence modeling can weigh concepts differently by section.
+    """
+    results: List[SectionConcept] = []
+
+    for sec in sections:
+        if not sec.text:
+            continue
+
+        # Re-use your existing function; do NOT change its behavior.
+        concepts = extract_concepts(sec.text)
+
+        for c in concepts:
+            results.append(
+                SectionConcept(
+                    concept=c,
+                    paper_id=paper_id,
+                    section_title=sec.title or None,
+                    section_level=sec.level,
+                )
+            )
+
+    return results
+
+
+def extract_concepts_from_document(doc: PaperDocument) -> List[SectionConcept]:
+    """
+    Convenience wrapper: extract section-aware concepts from a PaperDocument.
+    """
+    return extract_concepts_from_sections(doc.sections, paper_id=doc.paper_id)
+
+@dataclass
+class ConceptSummary:
+    """
+    Aggregated view of a concept within a single paper.
+
+    Attributes:
+        concept_key: A stable key for the concept
+                     (typically concept.name or (name, kind)).
+        base_name: Human-readable name for the concept.
+        kind: Optional concept kind/type (e.g. "method", "dataset").
+        mentions_total: Total number of mentions across all sections.
+        mentions_by_section: Raw counts per section title.
+        weighted_score: Section-weighted importance score for the concept.
+    """
+    concept_key: str
+    base_name: str
+    kind: Optional[str]
+    mentions_total: int
+    mentions_by_section: Dict[str, int] = field(default_factory=dict)
+    weighted_score: float = 0.0
+
+def _default_section_weights() -> Dict[str, float]:
+    """
+    Default heuristic weights per section title (case-insensitive).
+
+    You can override these in aggregate_section_concepts if needed.
+    """
+    # These are normalized by lowercase and simple substring checks.
+    return {
+        "introduction": 0.5,
+        "background": 0.7,
+        "related work": 0.7,
+        "preliminaries": 0.7,
+        "method": 1.5,      # matches "methods", "methodology", etc.
+        "approach": 1.5,
+        "model": 1.5,
+        "experiment": 1.3,
+        "results": 1.3,
+        "evaluation": 1.3,
+        "analysis": 1.2,
+        "discussion": 0.8,
+        "conclusion": 0.8,
+        "future work": 0.8,
+    }
+
+
+def _lookup_section_weight(
+    section_title: Optional[str],
+    weights: Mapping[str, float],
+    default_weight: float = 1.0,
+) -> float:
+    """
+    Map a section title to a weight using fuzzy, case-insensitive substring rules.
+    """
+    if not section_title:
+        return default_weight
+
+    title = section_title.lower()
+
+    # First, try exact normalized keys
+    if title in weights:
+        return weights[title]
+
+    # Otherwise, use substring matches (e.g., "introduction and overview")
+    # We keep it simple and deterministic: first match wins, based on insertion order.
+    for key, w in weights.items():
+        if key in title:
+            return w
+
+    return default_weight
+
+
+def aggregate_section_concepts(
+    section_concepts: Sequence["SectionConcept"],
+    section_weights: Optional[Mapping[str, float]] = None,
+    default_section_weight: float = 1.0,
+) -> Dict[str, ConceptSummary]:
+    """
+    Aggregate SectionConcept objects into per-concept summaries for a single paper.
+
+    Returns:
+        A dict mapping concept_key -> ConceptSummary.
+
+    Notes:
+        - concept_key defaults to concept.name if available, otherwise str(concept).
+        - If your Concept dataclass has a 'kind' attribute, it is used; otherwise None.
+        - weighted_score = sum_over_mentions(section_weight_for_that_section).
+    """
+    if section_weights is None:
+        section_weights = _default_section_weights()
+
+    # concept_key -> (base_name, kind, total_count, dict[section_title] -> count, weighted_score)
+    aggregates: Dict[str, Tuple[str, Optional[str], int, Dict[str, int], float]] = {}
+
+    for sc in section_concepts:
+        concept = sc.concept
+
+        # Try to be robust to whatever your existing Concept dataclass looks like
+        name = getattr(concept, "name", None) or str(concept)
+        kind = getattr(concept, "kind", None)
+
+        concept_key = name  # you can later change this to (name, kind) if needed
+
+        section_title = sc.section_title or "UNKNOWN"
+        weight = _lookup_section_weight(section_title, section_weights, default_section_weight)
+
+        if concept_key not in aggregates:
+            aggregates[concept_key] = (
+                name,            # base_name
+                kind,            # kind
+                0,               # total_count
+                defaultdict(int),# mentions_by_section
+                0.0,             # weighted_score
+            )
+
+        base_name, concept_kind, total, per_section, weighted_score = aggregates[concept_key]
+
+        total += 1
+        per_section[section_title] += 1
+        weighted_score += weight
+
+        aggregates[concept_key] = (base_name, concept_kind, total, per_section, weighted_score)
+
+    # Convert into ConceptSummary objects
+    summaries: Dict[str, ConceptSummary] = {}
+    for key, (base_name, concept_kind, total, per_section, weighted_score) in aggregates.items():
+        summaries[key] = ConceptSummary(
+            concept_key=key,
+            base_name=base_name,
+            kind=concept_kind,
+            mentions_total=total,
+            mentions_by_section=dict(per_section),
+            weighted_score=weighted_score,
+        )
+
+    return summaries
 
 
 # ----------------------------------------------------------------------

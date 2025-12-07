@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 import networkx as nx
 import numpy as np
 
+from kg_ai_papers.nlp.concept_extraction import ConceptSummary
 from kg_ai_papers.graph.schema import EdgeType, NodeType
 from kg_ai_papers.models.paper import Paper
 
@@ -232,3 +233,96 @@ def build_graph(
     #  for enriched data; citation_map is enough for tests.)
 
     return G
+
+def paper_node_id(paper_id: str) -> str:
+    """Return the canonical node id for a paper."""
+    return f"paper:{paper_id}"
+
+
+def concept_node_id(concept_key: str) -> str:
+    """Return the canonical node id for a concept."""
+    return f"concept:{concept_key}"
+
+def add_concept_summaries_for_paper(
+    graph: nx.MultiDiGraph,
+    paper_id: str,
+    concept_summaries: Dict[str, ConceptSummary],
+) -> None:
+    """
+    Ensure a paper node exists and attach concept nodes + edges based on ConceptSummary.
+
+    Args:
+        graph: The graph to mutate.
+        paper_id: Internal id for the paper (e.g. "arxiv:2401.00001").
+        concept_summaries: Mapping concept_key -> ConceptSummary.
+    """
+    p_node = paper_node_id(paper_id)
+
+    # Make sure the paper node exists; if your existing builder already creates it,
+    # this will simply add attributes or noop.
+    if p_node not in graph:
+        graph.add_node(p_node, type="paper", paper_id=paper_id)
+
+    for c_key, summary in concept_summaries.items():
+        c_node = concept_node_id(c_key)
+
+        # Create or update the concept node
+        if c_node not in graph:
+            graph.add_node(
+                c_node,
+                type="concept",
+                concept_key=summary.concept_key,
+                name=summary.base_name,
+                kind=summary.kind,
+            )
+        else:
+            # Optionally, update attributes on existing concept nodes
+            node_data = graph.nodes[c_node]
+            node_data.setdefault("type", "concept")
+            node_data.setdefault("concept_key", summary.concept_key)
+            node_data.setdefault("name", summary.base_name)
+            if summary.kind is not None:
+                node_data.setdefault("kind", summary.kind)
+
+        # Add / annotate the edge from paper -> concept
+        graph.add_edge(
+            p_node,
+            c_node,
+            type="MENTIONS_CONCEPT",
+            mentions_total=summary.mentions_total,
+            mentions_by_section=summary.mentions_by_section,
+            weighted_score=summary.weighted_score,
+        )
+
+def attach_concepts_to_graph(
+    graph: nx.MultiDiGraph,
+    paper_concept_summaries: Dict[str, Dict[str, ConceptSummary]],
+) -> nx.MultiDiGraph:
+    """
+    Attach concept summaries for many papers.
+
+    Args:
+        graph: An existing graph (e.g., already containing Paper + citation edges).
+        paper_concept_summaries: Dict mapping paper_id ->
+                                 (dict mapping concept_key -> ConceptSummary).
+
+    Returns:
+        The same graph instance, for convenience.
+    """
+    for paper_id, summaries in paper_concept_summaries.items():
+        add_concept_summaries_for_paper(graph, paper_id, summaries)
+    return graph
+
+def get_paper_concept_edges(
+    graph: nx.MultiDiGraph,
+    paper_id: str,
+    concept_key: str,
+) -> List[Dict[str, Any]]:
+    """
+    Return all edge attribute dicts for edges between a paper and concept node.
+    """
+    p_node = paper_node_id(paper_id)
+    c_node = concept_node_id(concept_key)
+
+    edge_dict = graph.get_edge_data(p_node, c_node) or {}
+    return list(edge_dict.values())
