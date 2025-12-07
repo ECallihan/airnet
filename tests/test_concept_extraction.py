@@ -1,8 +1,23 @@
 # tests/test_concept_extraction.py
+from typing import Iterable, List, Optional
 
+from kg_ai_papers.config.settings import Settings, RuntimeMode
 from kg_ai_papers.models.paper import Paper
 from kg_ai_papers.models.section import Section
 from kg_ai_papers.nlp.concept_extraction import ConceptExtractor
+
+_settings = Settings()
+
+# Section kinds/titles to prioritize in LIGHT mode.
+# This is just a heuristic – you can refine it later.
+_LIGHT_MODE_IMPORTANT_SECTIONS = {
+    "abstract",
+    "introduction",
+    "background",
+    "related work",
+    "conclusion",
+    "summary",
+}
 
 
 def test_concept_extraction_basic():

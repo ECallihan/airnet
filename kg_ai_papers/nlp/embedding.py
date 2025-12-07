@@ -10,7 +10,14 @@ from sentence_transformers import SentenceTransformer
 
 from kg_ai_papers.config.settings import settings
 from kg_ai_papers.models.paper import Paper
+from kg_ai_papers.config.settings import Settings, RuntimeMode
 
+_settings = Settings()
+
+_DEFAULT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # or whatever you had
+_MODEL_NAME = _settings.embedding_model_name or _DEFAULT_MODEL
+
+_model: SentenceTransformer = SentenceTransformer(_MODEL_NAME)
 
 class EmbeddingModel:
     """
@@ -106,10 +113,17 @@ def get_embedding_model() -> EmbeddingModel:
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     """
-    Embed a batch of texts and return a list of embedding vectors (as Python lists).
+    Embed a list of texts, respecting Settings.enable_embeddings and runtime_mode.
     """
-    backend = get_embedding_model()
-    return backend.encode_texts(texts)
+    if not _settings.enable_embeddings:
+        # Very cheap fallback: return a trivial representation
+        # so that code paths don’t break. You can make this smarter later.
+        return [[0.0] * 3 for _ in texts]
+
+    batch_size = _settings.embedding_batch_size
+    # You can use batch_size in encode if you want:
+    # return _model.encode(texts, batch_size=batch_size, convert_to_numpy=False)
+    return _model.encode(texts, convert_to_numpy=False)
 
 
 def embed_text(text: str) -> List[float]:

@@ -1,10 +1,14 @@
 # kg_ai_papers/grobid_client.py
 
 from __future__ import annotations
+import asyncio
 
 import os
 from pathlib import Path
 from typing import Optional
+import httpx
+from kg_ai_papers.config.settings import Settings
+_settings = Settings()
 
 import requests
 
@@ -14,27 +18,20 @@ class GrobidClientError(Exception):
 
 
 class GrobidClient:
-    """
-    Minimal client for GROBID's processFulltextDocument endpoint.
+    def __init__(self, base_url: str, max_concurrent: Optional[int] = None) -> None:
+        self.base_url = base_url
+        self._max_concurrent = max_concurrent or _settings.grobid_max_concurrent_requests
+        self._sem = asyncio.Semaphore(self._max_concurrent)
+        self._client = httpx.AsyncClient(base_url=self.base_url, timeout=60.0)
 
-    Usage:
-        client = GrobidClient()
-        tei_path = client.process_pdf(pdf_path, paper_id="arxiv-2401.00001")
-    """
-
-    def __init__(
-        self,
-        base_url: Optional[str] = None,
-        tei_dir: Optional[Path | str] = None,
-        timeout: float = 60.0,
-    ) -> None:
-        self.base_url = base_url or os.getenv("GROBID_URL", "http://localhost:8070")
-        self.timeout = timeout
-
-        if tei_dir is None:
-            tei_dir = os.getenv("TEI_OUTPUT_DIR", "data/tei")
-        self.tei_dir = Path(tei_dir)
-        self.tei_dir.mkdir(parents=True, exist_ok=True)
+    async def process_fulltext(self, pdf_bytes: bytes) -> str:
+        async with self._sem:
+            resp = await self._client.post(
+                "/api/processFulltextDocument",
+                files={"input": ("file.pdf", pdf_bytes, "application/pdf")},
+            )
+            resp.raise_for_status()
+            return resp.text
 
     @property
     def _fulltext_url(self) -> str:

@@ -5,7 +5,8 @@ from __future__ import annotations
 from functools import lru_cache
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Sequence, Tuple, Optional
+from typing import Dict, List, Mapping, Sequence, Tuple, Optional, Iterable
+from kg_ai_papers.config.settings import Settings, RuntimeMode
 
 from kg_ai_papers.tei_parser import PaperSection
 from kg_ai_papers.documents import PaperDocument
@@ -15,6 +16,19 @@ from keybert import KeyBERT
 from kg_ai_papers.config.settings import settings
 from kg_ai_papers.models.concept import Concept, ConceptOccurrence
 from kg_ai_papers.models.paper import Paper
+
+_settings = Settings()
+
+# Section kinds/titles to prioritize in LIGHT mode.
+# This is just a heuristic – you can refine it later.
+_LIGHT_MODE_IMPORTANT_SECTIONS = {
+    "abstract",
+    "introduction",
+    "background",
+    "related work",
+    "conclusion",
+    "summary",
+}
 
 
 class ConceptExtractor:
@@ -224,11 +238,59 @@ def extract_concepts_from_sections(
     return results
 
 
-def extract_concepts_from_document(doc: PaperDocument) -> List[SectionConcept]:
+def extract_concepts_from_document(
+    doc: "PaperDocument",
+    settings: Optional[Settings] = None,
+) -> List["SectionConcept"]:
     """
-    Convenience wrapper: extract section-aware concepts from a PaperDocument.
+    Extract concepts from a PaperDocument, with behavior modulated by runtime_mode.
+
+    STANDARD (default):
+        - Process all sections (current behavior).
+
+    LIGHT:
+        - Focus on the most important sections (abstract, intro, related work, conclusion).
+        - If those can’t be identified, fall back to the first few sections.
+
+    HEAVY:
+        - For now, same as STANDARD. Later you might:
+            * increase candidate limits
+            * add extra passes (e.g., formula/concept extraction)
     """
-    return extract_concepts_from_sections(doc.sections, paper_id=doc.paper_id)
+    settings = settings or _settings
+    sections: Iterable["PaperSection"] = doc.sections
+
+    if settings.runtime_mode == RuntimeMode.LIGHT:
+        # Prefer sections whose kind or title matches the important set
+        filtered = [
+            s
+            for s in sections
+            if (
+                s.kind
+                and s.kind.lower() in _LIGHT_MODE_IMPORTANT_SECTIONS
+            ) or (
+                s.title
+                and s.title.lower() in _LIGHT_MODE_IMPORTANT_SECTIONS
+            )
+        ]
+
+        # Fallback: if nothing matched, keep just the first few sections
+        if filtered:
+            sections_to_use = filtered
+        else:
+            # doc.sections is likely a list; if not, cast to list
+            all_sections = list(doc.sections)
+            sections_to_use = all_sections[:3]
+    else:
+        # STANDARD and HEAVY both process all sections for now
+        sections_to_use = doc.sections
+
+    concepts: List["SectionConcept"] = []
+    for section in sections_to_use:
+        concepts.extend(extract_concepts_from_section(section))
+
+    return concepts
+
 
 @dataclass
 class ConceptSummary:

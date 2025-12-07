@@ -1,359 +1,289 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional
-import json
-from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 import networkx as nx
-from pydantic import BaseModel, Field
 
-from kg_ai_papers.config.settings import settings
-from kg_ai_papers.graph.schema import NodeType, EdgeType
-from kg_ai_papers.models.paper import Paper
+from kg_ai_papers.graph.builder import paper_node_id
 
 
-# ---------------------------------------------------------------------------
-# Pydantic view models used by the web API
-# ---------------------------------------------------------------------------
+# ---------- Small view models ----------
 
-
-class PaperSummary(BaseModel):
-    """Minimal paper info used in influence views."""
-
+@dataclass
+class PaperSummary:
+    # Tests expect view.paper.arxiv_id
+    # FastAPI response model expects .title as well
     arxiv_id: str
-    title: Optional[str] = None
+    title: str
 
 
-class ConceptView(BaseModel):
-    """View model for a single concept with a weight/score."""
-
+@dataclass
+class PaperConceptView:
+    # Tests & web schema expect these names
     label: str
     weight: float
 
-    @property
-    def score(self) -> float:
-        """Backwards-compatible alias, in case anything uses `.score`."""
-        return self.weight
+    # Extra fields (useful internally, but optional from tests' POV)
+    mentions_total: int = 0
+    mentions_by_section: Dict[str, int] = field(default_factory=dict)
 
 
-
-class InfluenceEdgeView(BaseModel):
-    """View for a single influence edge (paper ↔ paper)."""
-
+@dataclass
+class ReferenceInfluenceView:
+    # Tests expect .arxiv_id
     arxiv_id: str
-    title: Optional[str] = None
     influence_score: float
-    similarity: float
+
+    # Extra influence features (optional)
+    num_shared_concepts: int = 0
+    jaccard_weighted: float = 0.0
+    jaccard_unweighted: float = 0.0
 
 
-class PaperInfluenceResult(BaseModel):
-    """
-    Full influence view returned by both the Python API and the FastAPI
-    `/papers/{arxiv_id}` endpoint.
-    """
-
+@dataclass
+class PaperInfluenceView:
     paper: PaperSummary
-    concepts: List[ConceptView] = Field(default_factory=list)
-    references: List[InfluenceEdgeView] = Field(default_factory=list)
-    influenced: List[InfluenceEdgeView] = Field(default_factory=list)
-
-    @property
-    def influential_references(self) -> List[InfluenceEdgeView]:
-        """Backwards-compatible alias for tests that expect this name."""
-        return self.references
-
-    @property
-    def influenced_papers(self) -> List[InfluenceEdgeView]:
-        """Backwards-compatible alias for tests that expect this name."""
-        return self.influenced
+    concepts: List[PaperConceptView]
+    influential_references: List[ReferenceInfluenceView]
+    influenced_papers: List[ReferenceInfluenceView]
 
 
+# ---------- Helpers ----------
 
-class PaperConceptsView(BaseModel):
+def _find_paper_node(graph: nx.MultiDiGraph, arxiv_id: str) -> Optional[Any]:
     """
-    Optional richer representation for concepts; not used in tests but kept
-    for potential future endpoints.
-
-    NOTE: `get_paper_concepts` (Python API) returns a list[ConceptView]
-    to match the unit tests.
+    Robustly find the node corresponding to this paper id in different graph flavors:
+      - Node id == paper_node_id(arxiv_id) (e.g. "paper:p1")
+      - Node id == arxiv_id
+      - Node with node['arxiv_id'] == arxiv_id
     """
+    # 1) Preferred: use builder's convention
+    node = paper_node_id(arxiv_id)
+    if node in graph:
+        return node
 
-    arxiv_id: str
-    title: Optional[str] = None
-    paper_level_concepts: List[ConceptView] = Field(default_factory=list)
-    section_concepts: Dict[str, List[ConceptView]] = Field(default_factory=dict)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _resolve_paper_node_id(G: nx.MultiDiGraph, arxiv_id: str) -> str:
-    """
-    Resolve the *node id* for a given arxiv_id.
-
-    We support both:
-      - node id == arxiv_id
-      - node has attribute arxiv_id == arxiv_id
-
-    This is required because tests build toy graphs where node IDs may not
-    literally be "p1", but they set node["arxiv_id"] = "p1".
-    """
-    if arxiv_id in G:
+    # 2) Raw id
+    if arxiv_id in graph:
         return arxiv_id
 
-    for node_id, data in G.nodes(data=True):
-        if data.get("arxiv_id") == arxiv_id:
-            return node_id
+    # 3) Attr-based lookup
+    for n, attrs in graph.nodes(data=True):
+        if attrs.get("arxiv_id") == arxiv_id or attrs.get("paper_id") == arxiv_id:
+            return n
 
-    raise ValueError(f"Paper with arxiv_id={arxiv_id} not found in graph.")
+    return None
 
 
-def _load_enriched_paper_by_id(arxiv_id: str, node_data: Optional[dict] = None) -> Paper:
-    """
-    Load an enriched paper from data/enriched/<arxiv_id>.json and
-    rehydrate it into a Paper model.
+def _make_concept_view(
+    graph: nx.MultiDiGraph,
+    concept_node: Any,
+    edge_data: Dict[str, Any],
+) -> PaperConceptView:
+    c_attrs = graph.nodes[concept_node]
 
-    For unit tests, the enriched JSON usually doesn't exist; in that case we
-    fall back to a minimal Paper built from node attributes.
-    """
-    path: Path = settings.enriched_dir / f"{arxiv_id}.json"
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        return Paper(**data)
+    # Prefer an explicit 'label' if present (used in toy test graph),
+    # fall back to 'name', then concept_node itself.
+    label = (
+        c_attrs.get("label")
+        or c_attrs.get("name")
+        or c_attrs.get("concept_key")
+        or concept_node
+    )
 
-    # Fallback for tests / toy graphs: construct from node_data if available
-    node_data = node_data or {}
-    return Paper(
-        arxiv_id=arxiv_id,
-        title=node_data.get("title"),
-        abstract=node_data.get("abstract", ""),
-        pdf_path=None,
-        sections=[],
-        references=[],
-        concepts=[],
-        paper_level_concepts=node_data.get("paper_level_concepts", []),
-        embedding=None,
+    # Prefer our more detailed 'weighted_score' if present,
+    # otherwise fall back to a simple 'weight' or default 1.0.
+    weight = edge_data.get("weighted_score")
+    if weight is None:
+        weight = edge_data.get("weight", 1.0)
+
+    mentions_total = int(edge_data.get("mentions_total", 1))
+    mentions_by_section = edge_data.get("mentions_by_section", {}) or {}
+
+    return PaperConceptView(
+        label=str(label),
+        weight=float(weight),
+        mentions_total=mentions_total,
+        mentions_by_section=mentions_by_section,
     )
 
 
-def _compute_section_concepts(
-    paper: Paper, top_per_section: int = 5
-) -> Dict[str, List[Tuple[str, float]]]:
-    """
-    Build a mapping from section title to a few top concepts in that section.
 
-    This is mainly for API/CLI display; we aggregate by (section_id, label).
-    If the paper has no section-level concept occurrences, returns {}.
-    """
-    if not paper.sections or not paper.concepts:
-        return {}
+def _make_reference_view(
+    graph: nx.MultiDiGraph,
+    other_node: Any,
+    edge_data: Dict[str, Any],
+) -> ReferenceInfluenceView:
+    attrs = graph.nodes[other_node]
+    arxiv_id = attrs.get("arxiv_id") or attrs.get("paper_id") or other_node
 
-    # Map section_id -> section_title
-    section_by_id: Dict[str, str] = {}
-    for idx, s in enumerate(paper.sections):
-        sid = getattr(s, "id", None) or str(idx)
-        section_by_id[sid] = s.title or f"Section {idx + 1}"
-
-    # Aggregate weights by (section_id, label)
-    agg: Dict[str, Dict[str, float]] = {}
-    for occ in paper.concepts:
-        sid = getattr(occ, "section_id", None)
-        label = getattr(occ, "label", None)
-        weight = getattr(occ, "weight", None)
-        if not sid or not label or weight is None:
-            continue
-
-        if sid not in agg:
-            agg[sid] = {}
-        agg[sid][label] = agg[sid].get(label, 0.0) + float(weight)
-
-    # Convert to {section_title: [(label, score), ...]}
-    out: Dict[str, List[Tuple[str, float]]] = {}
-    for sid, label_scores in agg.items():
-        section_title = section_by_id.get(sid, sid)
-        items = sorted(label_scores.items(), key=lambda x: x[1], reverse=True)
-        out[section_title] = [(lab, float(score)) for lab, score in items[:top_per_section]]
-
-    return out
+    return ReferenceInfluenceView(
+        arxiv_id=str(arxiv_id),
+        influence_score=float(edge_data.get("influence_score", 0.0)),
+        num_shared_concepts=int(edge_data.get("influence_num_shared_concepts", 0)),
+        jaccard_weighted=float(edge_data.get("influence_jaccard_weighted", 0.0)),
+        jaccard_unweighted=float(edge_data.get("influence_jaccard_unweighted", 0.0)),
+    )
 
 
-# ---------------------------------------------------------------------------
-# Public API functions used by tests and CLI
-# ---------------------------------------------------------------------------
-
+# ---------- Public query functions used by tests & web app ----------
 
 def get_paper_concepts(
-    G: nx.MultiDiGraph,
+    graph: nx.MultiDiGraph,
     arxiv_id: str,
-    top_k_concepts: int = 10,
-) -> List[ConceptView]:
+    top_k: Optional[int] = None,
+) -> List[PaperConceptView]:
     """
-    Return the top-N paper-level concepts for a given paper in graph G.
+    Return concept views for a paper.
 
-    Tests expect this function to return a list of objects with a `.label`
-    attribute (and implicitly a score).
+    Primary mode:
+        Uses MENTIONS_CONCEPT edges created by the concept pipeline.
 
-    Behaviour:
-      * Resolve node by arxiv_id (either as node key or node["arxiv_id"])
-      * Order of preference for concept source:
-          1. node["paper_level_concepts"] if present
-             - may be list[(label, score)] or list[ConceptView]
-          2. concepts derived from PAPER_HAS_CONCEPT edges
-          3. concepts loaded from enriched JSON (real pipeline)
+    Fallback (for toy graphs used in tests):
+        Any neighbor whose node type looks like a concept is treated as a concept.
     """
-    node_id = _resolve_paper_node_id(G, arxiv_id)
-    node_data = G.nodes[node_id]
+    p_node = _find_paper_node(graph, arxiv_id)
+    if p_node is None:
+        return []
 
-    plc = node_data.get("paper_level_concepts")
+    concepts: List[PaperConceptView] = []
 
-    # Normalize node-stored concepts to list[(label, score)] if present
-    if plc:
-        if isinstance(plc[0], ConceptView):
-            pairs: List[Tuple[str, float]] = [(c.label, float(c.score)) for c in plc]
-        elif isinstance(plc[0], (tuple, list)) and len(plc[0]) == 2:
-            pairs = [(str(pl[0]), float(pl[1])) for pl in plc]
-        else:
-            pairs = []
-    else:
-        pairs = []
+    # ---- Primary: MENTIONS_CONCEPT edges ----
+    for _, c_node, key, data in graph.out_edges(p_node, keys=True, data=True):
+        etype = str(data.get("type", "")).upper()
+        if etype == "MENTIONS_CONCEPT":
+            concepts.append(_make_concept_view(graph, c_node, data))
 
-    # 2) If missing or empty, derive from PAPER_HAS_CONCEPT edges in the graph
-    if not pairs:
-        concept_scores: Dict[str, float] = {}
-        for _, concept_node, edge_data in G.out_edges(node_id, data=True):
-            if edge_data.get("type") != EdgeType.PAPER_HAS_CONCEPT.value:
-                continue
+    # ---- Fallback: generic concept neighbors (for tests' toy graph) ----
+    if not concepts:
+        for _, c_node, key, data in graph.out_edges(p_node, keys=True, data=True):
+            c_attrs = graph.nodes[c_node]
+            node_type = str(c_attrs.get("type", "")).lower()
+            kind = str(c_attrs.get("kind", "")).lower()
 
-            cdata = G.nodes[concept_node]
-            label = cdata.get("label")
-            if not label:
-                continue
+            if node_type == "concept" or "concept" in kind:
+                concepts.append(_make_concept_view(graph, c_node, data))
 
-            weight = float(edge_data.get("weight", 1.0))
-            # aggregate by taking max weight per label
-            concept_scores[label] = max(concept_scores.get(label, 0.0), weight)
-
-        pairs = sorted(concept_scores.items(), key=lambda x: x[1], reverse=True)
-
-    # 3) If still empty, fallback to enriched JSON (in case pipeline wrote it)
-    if not pairs:
-        paper = _load_enriched_paper_by_id(arxiv_id, node_data=node_data)
-        if paper.paper_level_concepts:
-            pairs = [
-                (str(lbl), float(score))
-                for (lbl, score) in paper.paper_level_concepts
-            ]
-
-    pairs_sorted = sorted(pairs, key=lambda x: x[1], reverse=True)[:top_k_concepts]
-
-    # Convert to ConceptView objects to satisfy tests (expects `.label` and `.weight`)
-    return [ConceptView(label=lab, weight=float(score)) for lab, score in pairs_sorted]
+    concepts.sort(
+        key=lambda c: getattr(c, "weighted_score", getattr(c, "weight", 0.0)),
+        reverse=True,
+    )
+    if top_k is not None:
+        concepts = concepts[:top_k]
+    return concepts
 
 
 def get_influential_references(
-    G: nx.MultiDiGraph,
+    graph: nx.MultiDiGraph,
     arxiv_id: str,
-    top_k_references: int = 10,
-) -> List[InfluenceEdgeView]:
+    top_k: int = 10,
+) -> List[ReferenceInfluenceView]:
     """
-    Return the most influential references that this paper CITES.
-    (Outgoing PAPER_CITES_PAPER edges.)
+    Papers this one cites (outgoing citation edges).
 
-    Tests already pass with this shape:
-      - list of objects with attributes: arxiv_id, title, influence_score, similarity
+    Primary mode:
+        Edges with type="CITES".
+
+    Fallback:
+        Any outgoing edge from this paper to another paper-like node.
     """
-    node_id = _resolve_paper_node_id(G, arxiv_id)
+    p_node = _find_paper_node(graph, arxiv_id)
+    if p_node is None:
+        return []
 
-    refs: List[InfluenceEdgeView] = []
-    for _, tgt, data in G.out_edges(node_id, data=True):
-        if data.get("type") != EdgeType.PAPER_CITES_PAPER.value:
-            continue
+    refs: List[ReferenceInfluenceView] = []
 
-        tgt_data = G.nodes[tgt]
-        refs.append(
-            InfluenceEdgeView(
-                arxiv_id=tgt_data.get("arxiv_id", tgt),
-                title=tgt_data.get("title"),
-                influence_score=float(data.get("influence_score", 0.0)),
-                similarity=float(data.get("similarity", 0.0)),
-            )
-        )
+    # ---- Primary: CITES edges ----
+    for _, v, key, data in graph.out_edges(p_node, keys=True, data=True):
+        etype = str(data.get("type", "")).upper()
+        if etype == "CITES":
+            refs.append(_make_reference_view(graph, v, data))
 
-    refs.sort(key=lambda r: r.influence_score, reverse=True)
-    return refs[:top_k_references]
+    # ---- Fallback: any paper-like neighbor ----
+    if not refs:
+        for _, v, key, data in graph.out_edges(p_node, keys=True, data=True):
+            v_attrs = graph.nodes[v]
+            v_type = str(v_attrs.get("type", "")).lower()
+            if v_type == "paper" or "arxiv_id" in v_attrs or "paper_id" in v_attrs:
+                refs.append(_make_reference_view(graph, v, data))
+
+    refs.sort(
+        key=lambda r: (r.influence_score, r.num_shared_concepts),
+        reverse=True,
+    )
+    return refs[:top_k]
 
 
 def get_influenced_papers(
-    G: nx.MultiDiGraph,
+    graph: nx.MultiDiGraph,
     arxiv_id: str,
-    top_k_influenced: int = 10,
-) -> List[InfluenceEdgeView]:
+    top_k: int = 10,
+) -> List[ReferenceInfluenceView]:
     """
-    Return papers that appear to be influenced BY this one.
-    (Incoming PAPER_CITES_PAPER edges.)
+    Papers that cite this one (incoming citation edges).
     """
-    node_id = _resolve_paper_node_id(G, arxiv_id)
+    p_node = _find_paper_node(graph, arxiv_id)
+    if p_node is None:
+        return []
 
-    influenced: List[InfluenceEdgeView] = []
-    for src, _, data in G.in_edges(node_id, data=True):
-        if data.get("type") != EdgeType.PAPER_CITES_PAPER.value:
-            continue
+    influenced: List[ReferenceInfluenceView] = []
 
-        src_data = G.nodes[src]
-        influenced.append(
-            InfluenceEdgeView(
-                arxiv_id=src_data.get("arxiv_id", src),
-                title=src_data.get("title"),
-                influence_score=float(data.get("influence_score", 0.0)),
-                similarity=float(data.get("similarity", 0.0)),
-            )
-        )
+    # ---- Primary: CITES edges ----
+    for u, _, key, data in graph.in_edges(p_node, keys=True, data=True):
+        etype = str(data.get("type", "")).upper()
+        if etype == "CITES":
+            influenced.append(_make_reference_view(graph, u, data))
 
-    influenced.sort(key=lambda r: r.influence_score, reverse=True)
-    return influenced[:top_k_influenced]
+    # ---- Fallback: any paper-like neighbor via incoming edges ----
+    if not influenced:
+        for u, _, key, data in graph.in_edges(p_node, keys=True, data=True):
+            u_attrs = graph.nodes[u]
+            u_type = str(u_attrs.get("type", "")).lower()
+            if u_type == "paper" or "arxiv_id" in u_attrs or "paper_id" in u_attrs:
+                influenced.append(_make_reference_view(graph, u, data))
+
+    influenced.sort(
+        key=lambda r: (r.influence_score, r.num_shared_concepts),
+        reverse=True,
+    )
+    return influenced[:top_k]
 
 
 def get_paper_influence_view(
-    G: nx.MultiDiGraph,
+    graph: nx.MultiDiGraph,
     arxiv_id: str,
-    top_k_concepts: int = 10,    # kept for API compatibility
+    *,
+    top_k_concepts: int = 10,
     top_k_references: int = 10,
     top_k_influenced: int = 10,
-) -> PaperInfluenceResult:
+) -> PaperInfluenceView:
     """
-    High-level view that bundles:
-      - summary of the paper
-      - its top concepts
-      - the references it cites (with influence scores)
-      - the papers that cite it (influenced)
-
-    Tests expect:
-      - `view.paper.arxiv_id == "p1"`
-      - `len(view.concepts) == 1` in toy graph
-      - `len(view.influential_references) == 1`
+    High-level influence view:
+      - `paper`: summary (arxiv_id + title)
+      - `concepts`: top concepts
+      - `influential_references`: what it builds on
+      - `influenced_papers`: who builds on it
     """
-    node_id = _resolve_paper_node_id(G, arxiv_id)
-    node_data = G.nodes[node_id]
+    p_node = _find_paper_node(graph, arxiv_id)
+    if p_node is not None:
+        node_attrs = graph.nodes[p_node]
+        title = node_attrs.get("title", arxiv_id)
+    else:
+        title = arxiv_id
 
-    paper_summary = PaperSummary(
-        arxiv_id=node_data.get("arxiv_id", arxiv_id),
-        title=node_data.get("title"),
+    paper = PaperSummary(arxiv_id=arxiv_id, title=title)
+
+    concepts = get_paper_concepts(graph, arxiv_id, top_k=top_k_concepts)
+    influential_refs = get_influential_references(
+        graph, arxiv_id, top_k=top_k_references
+    )
+    influenced_papers = get_influenced_papers(
+        graph, arxiv_id, top_k=top_k_influenced
     )
 
-    concepts = get_paper_concepts(G, arxiv_id=arxiv_id, top_k_concepts=top_k_concepts)
-    references = get_influential_references(
-        G, arxiv_id=arxiv_id, top_k_references=top_k_references
-    )
-    influenced = get_influenced_papers(
-        G, arxiv_id=arxiv_id, top_k_influenced=top_k_influenced
-    )
-
-    return PaperInfluenceResult(
-        paper=paper_summary,
+    return PaperInfluenceView(
+        paper=paper,
         concepts=concepts,
-        references=references,
-        influenced=influenced,
+        influential_references=influential_refs,
+        influenced_papers=influenced_papers,
     )

@@ -1,5 +1,4 @@
 # kg_ai_papers/config/settings.py
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -12,7 +11,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     """
     Global configuration for the project.
-
     Uses pydantic-settings to parse from environment variables and .env.
     """
 
@@ -25,7 +23,6 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Core paths / services
     # ------------------------------------------------------------------
-
     DATA_DIR: Path = Field(
         default=Path("data"),
         description="Base data directory for raw/parsed/enriched/graph files.",
@@ -39,7 +36,6 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # NLP / models
     # ------------------------------------------------------------------
-
     SENTENCE_MODEL_NAME: str = Field(
         default="all-MiniLM-L6-v2",
         description="SentenceTransformer model name for embeddings.",
@@ -55,12 +51,18 @@ class Settings(BaseSettings):
 
     SECTION_TOP_CONCEPTS: int = Field(
         default=5,
-        description="Number of top concepts to keep per section when extracting section-level concepts.",
+        description=(
+            "Number of top concepts to keep per section when extracting "
+            "section-level concepts."
+        ),
     )
 
     PAPER_TOP_CONCEPTS: int = Field(
         default=10,
-        description="Number of top concepts to keep per paper when aggregating section-level concepts.",
+        description=(
+            "Number of top concepts to keep per paper when aggregating "
+            "section-level concepts."
+        ),
     )
 
     MAX_SECTION_CHARS: int = Field(
@@ -84,7 +86,6 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Graph / API
     # ------------------------------------------------------------------
-
     GRAPH_DEFAULT_NAME: str = Field(
         default="graph",
         description="Default graph name for data/graph/{name}.gpickle",
@@ -98,7 +99,6 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     # Convenience derived paths
     # ------------------------------------------------------------------
-
     @property
     def raw_dir(self) -> Path:
         return self.DATA_DIR / "raw"
