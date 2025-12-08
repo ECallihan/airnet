@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 from pydantic import BaseModel, Field
-
 
 class ConceptSummary(BaseModel):
     """
@@ -25,7 +24,19 @@ class PaperSummary(BaseModel):
         description="Abstract of the paper, if available.",
     )
 
-
+class PaperDetail(BaseModel):
+    """
+    Detailed view of a paper, including metadata and influence information.
+    This is the response model for GET /papers/{arxiv_id}.
+    """
+    paper: PaperSummary = Field(
+        ...,
+        description="Summary metadata for the focal paper.",
+    )
+    influence: Dict[str, Any] = Field(
+        ...,
+        description="Graph-derived influence information for this paper.",
+    )
 class NeighborPaperInfluence(BaseModel):
     """
     Represents how strongly a neighbor paper (referenced or citing) is related

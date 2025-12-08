@@ -315,11 +315,14 @@ def ingest_arxiv_paper(
     Steps:
       1. Download the PDF for arxiv_id into work_dir.
       2. Run ingest_pdf (GROBID → TEI → sections → concepts).
-      3. Build an IngestedPaperResult with a (possibly minimal) Paper model.
+      3. Build an IngestedPaperResult with a Paper model populated from arXiv
+         metadata where possible.
     """
-    work_dir = Path(work_dir)
+    from pathlib import Path as _Path  # just to be safe if called with str
 
-    # 1) Download the PDF
+    work_dir = _Path(work_dir)
+
+    # 1) Download the PDF (will raise RuntimeError if arxiv_id is invalid)
     pdf_path = _download_arxiv_pdf(arxiv_id, work_dir)
 
     # 2) Run the core ingestion
@@ -331,8 +334,35 @@ def ingest_arxiv_paper(
         work_dir=work_dir,
     )
 
-    # 3) Build a (currently minimal) Paper model
-    paper = Paper(arxiv_id=arxiv_id)
+    # 3) Fetch metadata from arXiv and build a Paper model
+    title = ""
+    abstract = ""
+
+    try:
+        import arxiv  # local import to keep optional
+
+        search = arxiv.Search(id_list=[arxiv_id])
+        client = arxiv.Client()
+        results = client.results(search)
+
+        try:
+            result = next(results)
+            # arxiv.Result has `.title` and `.summary` (abstract)
+            title = result.title or ""
+            abstract = result.summary or ""
+        except StopIteration:
+            # Shouldn't happen if _download_arxiv_pdf succeeded, but be robust
+            pass
+    except Exception:
+        # Metadata fetch failure shouldn't kill ingestion; fall back to blanks
+        pass
+
+    paper = Paper(
+        arxiv_id=arxiv_id,
+        title=title,
+        abstract=abstract,
+        pdf_path=str(pdf_path),
+    )
 
     if references is None:
         references = []
@@ -342,7 +372,6 @@ def ingest_arxiv_paper(
         concept_summaries=ingested.concept_summaries,
         references=references,
     )
-
 # -----------------------------------------------------------------------------
 # Optional convenience: ingest + update NetworkX graph in one call
 # -----------------------------------------------------------------------------
