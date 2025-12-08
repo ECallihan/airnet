@@ -1,189 +1,427 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import networkx as nx
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from kg_ai_papers.graph.io import load_graph, save_graph
-from kg_ai_papers.ingest.pipeline import ingest_arxiv_paper, IngestedPaperResult
-from kg_ai_papers.graph.builder import update_graph_with_ingested_paper
+from kg_ai_papers.config.settings import settings
+from kg_ai_papers.graph.storage import load_latest_graph
 
-# -----------------------------------------------------------------------------
-# Settings / config
-# -----------------------------------------------------------------------------
+# Use a real FastAPI app so TestClient(app) works as expected
+app = FastAPI()
 
-DEFAULT_GRAPH_PATH = Path("data/graphs/airnet.gpickle")
+# ---------------------------------------------------------------------------
+# Graph access
+# ---------------------------------------------------------------------------
+
+_GRAPH_CACHE: Optional[nx.MultiDiGraph] = None
 
 
-def _get_graph_path() -> Path:
+def _load_graph_from_disk() -> nx.MultiDiGraph:
     """
-    Locate the on-disk graph file. For now we just use a fixed default path.
-    In the future this could read from env vars or config.
+    Default graph loader used in production.
+
+    In tests, this function is bypassed because test modules monkeypatch
+    get_graph() directly to return a small synthetic graph.
     """
-    return DEFAULT_GRAPH_PATH
+    global _GRAPH_CACHE
 
+    if _GRAPH_CACHE is not None:
+        return _GRAPH_CACHE
 
-# -----------------------------------------------------------------------------
-# FastAPI app
-# -----------------------------------------------------------------------------
+    G = load_latest_graph(settings.graph_dir)
+    if G is None:
+        raise RuntimeError(
+            f"No graph found in {settings.graph_dir}. "
+            "Run the ingestion pipeline first."
+        )
 
-app = FastAPI(title="AI Papers Graph API", version="0.1.0")
+    _GRAPH_CACHE = G
+    return G
 
-
-# -----------------------------------------------------------------------------
-# Graph loading and helpers
-# -----------------------------------------------------------------------------
 
 def get_graph() -> nx.MultiDiGraph:
     """
-    Load the NetworkX graph from disk.
+    Indirection point for retrieving the in-memory graph.
 
-    In tests, this function is monkeypatched to return an in-memory graph,
-    so the implementation here is only used in "real" runs.
+    Tests monkeypatch this function, so all endpoints must call get_graph()
+    rather than touching _GRAPH_CACHE directly.
     """
-    path = _get_graph_path()
-    return load_graph(path)
+    return _load_graph_from_disk()
 
 
-def _find_paper_node(G: nx.MultiDiGraph, arxiv_id: str) -> Optional[str]:
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _find_paper_node(graph: nx.MultiDiGraph, arxiv_id: str) -> Optional[Any]:
     """
-    Locate the node id of a paper with the given arxiv_id attribute.
+    Robustly find the node corresponding to this paper id in different graph flavors:
+      - node id == f"paper:{arxiv_id}"
+      - node id == arxiv_id
+      - node with node['arxiv_id'] == arxiv_id or node['paper_id'] == arxiv_id
     """
-    for node_id, data in G.nodes(data=True):
-        if data.get("kind") == "paper" and data.get("arxiv_id") == arxiv_id:
-            return node_id
+    candidates: List[Any] = []
+
+    # 1) paper:ID
+    prefixed = f"paper:{arxiv_id}"
+    if prefixed in graph:
+        candidates.append(prefixed)
+
+    # 2) raw id
+    if arxiv_id in graph:
+        candidates.append(arxiv_id)
+
+    # 3) node attribute matches
+    for n, attrs in graph.nodes(data=True):
+        if attrs.get("arxiv_id") == arxiv_id or attrs.get("paper_id") == arxiv_id:
+            candidates.append(n)
+
+    return candidates[0] if candidates else None
+
+
+def _node_kind(attrs: Dict[str, Any]) -> str:
+    return str(attrs.get("type") or attrs.get("kind") or "").lower() or "unknown"
+
+
+def _node_label(node: Any, attrs: Dict[str, Any]) -> str:
+    return (
+        attrs.get("title")
+        or attrs.get("label")
+        or attrs.get("name")
+        or attrs.get("concept_key")
+        or str(node)
+    )
+
+
+def _paper_from_node(node: Any, attrs: Dict[str, Any]) -> "PaperNode":
+    """
+    Normalize a graph paper node into our API PaperNode model,
+    stripping reserved fields from attributes.
+    """
+    data = dict(attrs)  # shallow copy
+
+    # Pull out reserved/top-level fields
+    arxiv_id = str(data.pop("arxiv_id", data.pop("paper_id", str(node))))
+    title = data.pop("title", None)
+    abstract = data.pop("abstract", None)
+
+    # Strip reserved meta
+    for reserved in ("kind", "type", "label", "name"):
+        data.pop(reserved, None)
+
+    return PaperNode(
+        id=str(node),
+        arxiv_id=arxiv_id,
+        title=title,
+        abstract=abstract,
+        attributes=data,
+    )
+
+
+def _concept_from_node(
+    node: Any,
+    attrs: Dict[str, Any],
+    importance: Optional[float] = None,
+) -> "ConceptNode":
+    """
+    Normalize a concept node and attach optional importance.
+    """
+    data = dict(attrs)
+    key = data.pop("concept_key", data.pop("key", data.get("label") or str(node)))
+    label = data.pop("label", data.get("name") or key)
+
+    # Strip reserved meta
+    for reserved in ("kind", "type", "name"):
+        data.pop(reserved, None)
+
+    # Attach importance if provided
+    if importance is not None:
+        data["importance"] = importance
+
+    return ConceptNode(
+        id=str(node),
+        key=str(key),
+        label=str(label),
+        attributes=data,
+    )
+
+
+def _edge_attr_or_none(
+    graph: nx.MultiDiGraph,
+    u: Any,
+    v: Any,
+    attr: str,
+) -> Optional[Any]:
+    """
+    Safely extract a single edge attribute from u->v, handling both DiGraph
+    and MultiDiGraph edge data structures.
+    """
+    if not graph.has_edge(u, v):
+        return None
+
+    data = graph.get_edge_data(u, v, default=None)
+    if data is None:
+        return None
+
+    # MultiDiGraph: mapping key -> data dict
+    if isinstance(graph, nx.MultiDiGraph):
+        # data is {edge_key: {attrs}}
+        for _, d in data.items():
+            if isinstance(d, dict) and attr in d:
+                return d[attr]
+        return None
+
+    # DiGraph or Graph: data is the attrs dict
+    if isinstance(data, dict):
+        return data.get(attr)
+
     return None
 
-
-def _deslug_concept_key(slug: str) -> str:
+def _edge_weight(
+    graph: nx.MultiDiGraph,
+    u: Any,
+    v: Any,
+) -> Optional[float]:
     """
-    Convert a URL slug like 'test-concept' back into a human label 'test concept'.
+    Extract a representative weight/score/importance from edges u->v,
+    handling both DiGraph and MultiDiGraph.
+
+    For MultiDiGraph we take the max weight across parallel edges.
     """
-    return slug.replace("-", " ")
+    if not graph.has_edge(u, v):
+        return None
 
+    data = graph.get_edge_data(u, v, default=None)
+    if data is None:
+        return None
 
-def _slugify(label: str) -> str:
+    # MultiDiGraph: mapping edge_key -> data dict
+    if isinstance(graph, nx.MultiDiGraph):
+        weights: List[float] = []
+        for _, d in data.items():
+            if not isinstance(d, dict):
+                continue
+            val = d.get("weight") or d.get("score") or d.get("importance")
+            if isinstance(val, (int, float)):
+                weights.append(float(val))
+        if not weights:
+            return None
+        return max(weights)
+
+    # DiGraph / Graph: data is a single attrs dict
+    if isinstance(data, dict):
+        val = data.get("weight") or data.get("score") or data.get("importance")
+        if isinstance(val, (int, float)):
+            return float(val)
+
+    return None
+
+def _paper_influence(
+    graph: nx.MultiDiGraph,
+    node: Any,
+) -> tuple[List[InfluenceNeighbor], List[InfluenceNeighbor]]:
     """
-    Very simple slugifier used for 'key' fields:
-        'Test Concept' -> 'test-concept'
+    Collect incoming and outgoing paper-level influence edges for a given paper.
+
+    - Incoming: neighbors that point to this paper (neighbor -> paper)
+    - Outgoing: this paper points to neighbor (paper -> neighbor)
     """
-    return label.strip().lower().replace(" ", "-")
+    incoming_ids: Set[Any] = set(graph.predecessors(node))
+    outgoing_ids: Set[Any] = set(graph.successors(node))
 
+    incoming: List[InfluenceNeighbor] = []
+    outgoing: List[InfluenceNeighbor] = []
 
-def _find_concept_node(G: nx.MultiDiGraph, concept_slug: str) -> Optional[str]:
-    """
-    Locate a concept node given a slug from the URL path.
-
-    We try the following, in order:
-
-    1. Direct node id patterns:
-        - 'concept:{slug}'          (e.g. 'concept:test-concept')
-        - 'concept::{label}'        (e.g. 'concept::test concept')
-        - '{slug}'                  (e.g. 'test-concept')
-        - '{label}'                 (e.g. 'test concept')
-    2. Attribute-based match on:
-        - 'label'
-        - 'base_name'
-        - 'concept_key'
-        - 'slug'
-    """
-    label = _deslug_concept_key(concept_slug)
-
-    # 1) Try common node id patterns used in tests and pipeline
-    candidate_ids = [
-        f"concept:{concept_slug}",
-        f"concept::{label}",
-        concept_slug,
-        label,
-    ]
-    for nid in candidate_ids:
-        if nid in G:
-            data = G.nodes[nid]
-            if data.get("kind") == "concept":
-                return nid
-
-    # 2) Fallback to attribute-based search
-    for node_id, data in G.nodes(data=True):
-        if data.get("kind") != "concept":
+    # Incoming influence: neighbor cites this paper
+    for nbr in incoming_ids:
+        attrs = graph.nodes[nbr]
+        kind = _node_kind(attrs)
+        if kind != "paper" and "paper" not in kind:
             continue
 
-        if concept_slug == data.get("slug"):
-            return node_id
+        neighbor_paper = _paper_from_node(nbr, attrs)
+        relation = _edge_attr_or_none(graph, nbr, node, "relation")
+        weight = _edge_weight(graph, nbr, node)
 
-        if label in {
-            data.get("label"),
-            data.get("base_name"),
-            data.get("concept_key"),
-        }:
-            return node_id
-
-    return None
-
-
-@lru_cache(maxsize=1)
-def _cached_search_nodes() -> List[Dict[str, Any]]:
-    """
-    Build a simple in-memory search index over graph nodes.
-
-    NOTE: Tests reach in and call `_cached_search_nodes.cache_clear()`, so the
-    name and the fact that it's LRU-cached are intentional API.
-
-    Each entry in the returned list is:
-        {
-            "id": <node_id>,          # actual graph node id
-            "kind": <"paper"/"concept"/...>,
-            "label": <best human label>,
-            "text": <searchable text blob>,
-        }
-    """
-    G = get_graph()
-
-    index: List[Dict[str, Any]] = []
-
-    for node_id, data in G.nodes(data=True):
-        kind = data.get("kind")
-
-        # Heuristic for a human-readable label
-        label = (
-            data.get("title")
-            or data.get("label")
-            or data.get("base_name")
-            or data.get("concept_key")
-            or data.get("arxiv_id")
-            or str(node_id)
+        incoming.append(
+            InfluenceNeighbor(
+                paper=neighbor_paper,
+                direction="in",
+                relation=str(relation) if relation is not None else None,
+                weight=weight,
+            )
         )
 
-        # Basic full-text content
-        corpus_bits = [
-            str(node_id),
-            kind or "",
-            str(label),
-            str(data.get("abstract", "")),
-            str(data.get("arxiv_id", "")),
-        ]
-        text = " ".join(corpus_bits).lower()
+    # Outgoing influence: this paper cites neighbor
+    for nbr in outgoing_ids:
+        attrs = graph.nodes[nbr]
+        kind = _node_kind(attrs)
+        if kind != "paper" and "paper" not in kind:
+            continue
 
-        index.append(
-            {
-                "id": node_id,     # IMPORTANT: real graph node id, no munging
-                "kind": kind,
-                "label": label,
-                "text": text,
-            }
+        neighbor_paper = _paper_from_node(nbr, attrs)
+        relation = _edge_attr_or_none(graph, node, nbr, "relation")
+        weight = _edge_weight(graph, node, nbr)
+
+        outgoing.append(
+            InfluenceNeighbor(
+                paper=neighbor_paper,
+                direction="out",
+                relation=str(relation) if relation is not None else None,
+                weight=weight,
+            )
         )
 
-    return index
+    # Sort for deterministic behavior: strongest first, then arxiv_id
+    incoming.sort(
+        key=lambda n: (
+            -(n.weight if n.weight is not None else 0.0),
+            n.paper.arxiv_id,
+        )
+    )
+    outgoing.sort(
+        key=lambda n: (
+            -(n.weight if n.weight is not None else 0.0),
+            n.paper.arxiv_id,
+        )
+    )
+
+    return incoming, outgoing
 
 
-# -----------------------------------------------------------------------------
-# Response models
-# -----------------------------------------------------------------------------
+def _paper_neighbors(graph: nx.MultiDiGraph, node: Any) -> List["NeighborNode"]:
+    """
+    Collect paper neighbors of a paper, excluding concept nodes.
 
-class PaperModel(BaseModel):
+    New behavior: each neighbor includes a 'direction' field relative to the
+    paper node:
+      - 'out'  : edge from paper -> neighbor
+      - 'in'   : edge from neighbor -> paper
+      - 'both' : edges in both directions
+
+    Also includes a 'relation' field populated from the edge metadata
+    (e.g. 'CITES', 'PAPER_CITES_PAPER') when available.
+    """
+    neighbors: Set[Any] = set(graph.predecessors(node)) | set(graph.successors(node))
+    results: List[NeighborNode] = []
+
+    for nbr in neighbors:
+        if nbr == node:
+            continue
+        attrs: Dict[str, Any] = graph.nodes[nbr]
+        kind = _node_kind(attrs)
+        if kind != "paper" and "paper" not in kind:
+            # Only paper neighbors belong in this collection.
+            continue
+
+        label = _node_label(nbr, attrs)
+
+        has_out = graph.has_edge(node, nbr)
+        has_in = graph.has_edge(nbr, node)
+
+        if has_out and has_in:
+            direction = "both"
+        elif has_out:
+            direction = "out"
+        elif has_in:
+            direction = "in"
+        else:
+            direction = "unknown"
+
+        # Prefer relation metadata from the edge in the direction we report
+        relation = None
+        if direction in ("out", "both"):
+            relation = _edge_attr_or_none(graph, node, nbr, "relation")
+        if relation is None and direction in ("in", "both"):
+            relation = _edge_attr_or_none(graph, nbr, node, "relation")
+
+        results.append(
+            NeighborNode(
+                id=str(nbr),
+                kind="paper",
+                label=str(label),
+                direction=direction,
+                relation=str(relation) if relation is not None else None,
+            )
+        )
+
+    # Stable ordering: sort by label then id
+    results.sort(key=lambda n: (n.label, n.id))
+    return results
+
+
+def _concepts_for_paper(graph: nx.MultiDiGraph, node: Any) -> List["ConceptNode"]:
+    """
+    Collect concept nodes connected to this paper, along with an 'importance'
+    score derived from edge attributes where available.
+    """
+    neighbors: Set[Any] = set(graph.predecessors(node)) | set(graph.successors(node))
+    scores: Dict[Any, float] = {}
+
+    def _edge_datas(u: Any, v: Any) -> Iterable[Dict[str, Any]]:
+        # Support both DiGraph and MultiDiGraph
+        if isinstance(graph, nx.MultiDiGraph):
+            # MultiDiGraph: graph[u][v] is a dict keyed by edge key
+            for _, data in graph.get_edge_data(u, v, default={}).items():
+                yield data
+        else:
+            # DiGraph: graph[u][v] is the data dict
+            data = graph.get_edge_data(u, v, default=None)
+            if data:
+                yield data
+
+    # Aggregate importance/weight/score from edges between paper and concept
+    for nbr in neighbors:
+        attrs = graph.nodes[nbr]
+        kind = _node_kind(attrs)
+        if kind != "concept" and "concept" not in kind:
+            continue
+
+        total = 0.0
+        found_any = False
+        for data in _edge_datas(node, nbr):
+            for field in ("importance", "weight", "score"):
+                if field in data and isinstance(data[field], (int, float)):
+                    total += float(data[field])
+                    found_any = True
+        for data in _edge_datas(nbr, node):
+            for field in ("importance", "weight", "score"):
+                if field in data and isinstance(data[field], (int, float)):
+                    total += float(data[field])
+                    found_any = True
+
+        scores[nbr] = total if found_any else 0.0
+
+    concepts: List[ConceptNode] = []
+    for nbr, attrs in graph.nodes(data=True):
+        if nbr not in neighbors:
+            continue
+        kind = _node_kind(attrs)
+        if kind != "concept" and "concept" not in kind:
+            continue
+
+        importance = scores.get(nbr)
+        concepts.append(_concept_from_node(nbr, attrs, importance=importance))
+
+    # Stable ordering by importance (descending) then id
+    concepts.sort(
+        key=lambda c: (float(c.attributes.get("importance", 0.0)), c.id),
+        reverse=True,
+    )
+    return concepts
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+
+class PaperNode(BaseModel):
     id: str
     arxiv_id: str
     title: Optional[str] = None
@@ -191,523 +429,273 @@ class PaperModel(BaseModel):
     attributes: Dict[str, Any] = Field(default_factory=dict)
 
 
-class ConceptSummaryModel(BaseModel):
+class ConceptNode(BaseModel):
     id: str
     key: str
     label: str
-    relation: Optional[str] = None
-    weight: Optional[float] = None
     attributes: Dict[str, Any] = Field(default_factory=dict)
 
 
-class NeighborModel(BaseModel):
+class NeighborNode(BaseModel):
     id: str
-    kind: Optional[str] = None
-    label: Optional[str] = None
+    kind: str
+    label: str
+    # Direction of edge relative to main paper
+    direction: str
+    # Relation string from edge metadata (e.g. "CITES")
     relation: Optional[str] = None
-    direction: str = Field(
-        ...,
-        description="Direction of the edge relative to the paper: 'out' or 'in'.",
-    )
-    weight: Optional[float] = None
-    attributes: Dict[str, Any] = Field(default_factory=dict)
 
 
-class PaperWithConceptsResponse(BaseModel):
-    paper: PaperModel
-    concepts: List[ConceptSummaryModel]
-    neighbors: List[NeighborModel] = Field(
-        default_factory=list,
-        description=(
-            "Non-concept neighbour nodes (typically other papers) directly "
-            "connected to this paper."
-        ),
-    )
+class PaperResponse(BaseModel):
+    paper: PaperNode
+    concepts: List[ConceptNode] = Field(default_factory=list)
+    neighbors: List[NeighborNode] = Field(default_factory=list)
 
 
-
-class ConceptWithPapersResponse(BaseModel):
-    concept: ConceptSummaryModel
-    papers: List[PaperModel]
-
-
-class SearchNodeResult(BaseModel):
-    # tests expect "node_id" field in hits
+class NodeSearchHit(BaseModel):
     node_id: str
-    kind: Optional[str] = None
+    kind: str
     label: str
+    score: float
 
 
-class SearchNodesResponse(BaseModel):
+class NodeSearchResponse(BaseModel):
     query: str
-    hits: List[SearchNodeResult]
+    kind: Optional[str] = None
+    hits: List[NodeSearchHit]
 
 
-class ConceptStats(BaseModel):
-    id: str
-    key: str
-    label: str
-    degree: int
+class ConceptResponse(BaseModel):
+    concept: ConceptNode
+    papers: List[PaperNode]
+
+class InfluenceNeighbor(BaseModel):
+    paper: PaperNode
+    # 'in'  : neighbor -> focal paper (neighbor cites focal)
+    # 'out' : focal paper -> neighbor (focal cites neighbor)
+    direction: str
+    relation: Optional[str] = None
+    weight: Optional[float] = None
 
 
-class GraphStatsResponse(BaseModel):
-    num_nodes: int = Field(
-        ...,
-        description="Total number of nodes in the graph.",
-    )
-    num_edges: int = Field(
-        ...,
-        description="Total number of edges in the graph.",
-    )
-    num_papers: int = Field(
-        ...,
-        description="Number of paper nodes (kind='paper').",
-    )
-    num_concepts: int = Field(
-        ...,
-        description="Number of concept nodes (kind='concept').",
-    )
-    top_concepts: List[ConceptStats] = Field(
-        default_factory=list,
-        description="Top concepts ranked by degree.",
-    )
+class PaperInfluenceResponse(BaseModel):
+    paper: PaperNode
+    incoming: List[InfluenceNeighbor] = Field(default_factory=list)
+    outgoing: List[InfluenceNeighbor] = Field(default_factory=list)
 
-class IngestedPaperView(BaseModel):
-    """Minimal view of an ingested paper for API responses."""
-    arxiv_id: str
-    title: Optional[str] = None
-    abstract: Optional[str] = None
-    num_concepts: int = Field(
-        ...,
-        description="Number of aggregated concepts extracted for this paper.",
-    )
-    num_references: int = Field(
-        ...,
-        description="Number of references (arXiv ids) this paper cites.",
-    )
-
-
-class IngestFailure(BaseModel):
-    arxiv_id: str
-    error: str
-
-
-class BatchIngestRequest(BaseModel):
-    """Request body for batch arXiv ingestion."""
-    ids: List[str] = Field(
-        ...,
-        description="List of arXiv IDs to ingest.",
-    )
-    work_dir: Optional[str] = Field(
-        None,
-        description="Optional override for ingestion working directory.",
-    )
-    use_cache: bool = Field(
-        True,
-        description="If true, use ingestion cache when available.",
-    )
-    force_reingest: bool = Field(
-        False,
-        description="If true, ignore existing cache and recompute ingestion.",
-    )
-
-
-class BatchIngestResponse(BaseModel):
-    """Response for batch arXiv ingestion."""
-    requested_ids: List[str]
-    ingested: List[IngestedPaperView] = Field(
-        default_factory=list,
-        description="Successfully ingested papers.",
-    )
-    failed: List[IngestFailure] = Field(
-        default_factory=list,
-        description="Papers that failed to ingest.",
-    )
-    graph_num_nodes: int = Field(
-        ...,
-        description="Total number of nodes in the updated graph.",
-    )
-    graph_num_edges: int = Field(
-        ...,
-        description="Total number of edges in the updated graph.",
-    )
-
-# -----------------------------------------------------------------------------
-# Routes
-# -----------------------------------------------------------------------------
-
-@app.post("/ingest/arxiv", response_model=BatchIngestResponse)
-def ingest_arxiv_batch(request: BatchIngestRequest) -> BatchIngestResponse:
-    """Ingest a batch of arXiv papers and update the on-disk graph."""
-    # Normalize and de-duplicate ids while preserving order
-    raw_ids = [id_.strip() for id_ in (request.ids or []) if id_.strip()]
-    seen = set()
-    ids: List[str] = []
-    for arxiv_id in raw_ids:
-        if arxiv_id not in seen:
-            seen.add(arxiv_id)
-            ids.append(arxiv_id)
-
-    if not ids:
-        raise HTTPException(status_code=400, detail="No arXiv IDs provided.")
-
-    work_dir = Path(request.work_dir) if request.work_dir else Path("data/ingest")
-    work_dir.mkdir(parents=True, exist_ok=True)
-
-    # Load existing graph if present, otherwise start a new one
-    try:
-        G = get_graph()
-    except FileNotFoundError:
-        G = nx.MultiDiGraph()
-
-    ingested_views: List[IngestedPaperView] = []
-    failures: List[IngestFailure] = []
-
-    for arxiv_id in ids:
-        try:
-            result = ingest_arxiv_paper(
-                arxiv_id=arxiv_id,
-                work_dir=work_dir,
-                use_cache=request.use_cache,
-                force_reingest=request.force_reingest,
-            )
-        except Exception as exc:  # noqa: BLE001
-            failures.append(
-                IngestFailure(
-                    arxiv_id=arxiv_id,
-                    error=str(exc),
-                )
-            )
-            continue
-
-        # Update in-memory graph with this paper
-        update_graph_with_ingested_paper(G, result)
-
-        # Build a small view for the response
-        num_concepts = len(getattr(result, "concept_summaries", {}) or {})
-        num_refs = len(getattr(result, "references", []) or [])
-
-        ingested_views.append(
-            IngestedPaperView(
-                arxiv_id=result.paper.arxiv_id,
-                title=result.paper.title,
-                abstract=result.paper.abstract,
-                num_concepts=num_concepts,
-                num_references=num_refs,
-            )
-        )
-
-    if not ingested_views:
-        # Nothing succeeded; signal this to the client
-        raise HTTPException(
-            status_code=400,
-            detail="No papers were successfully ingested.",
-        )
-
-    # Persist the updated graph to disk
-    graph_path = _get_graph_path()
-    graph_path.parent.mkdir(parents=True, exist_ok=True)
-    save_graph(G, graph_path)
-
-    # Clear search cache so /search/nodes sees new content
-    _cached_search_nodes.cache_clear()
-
-    return BatchIngestResponse(
-        requested_ids=ids,
-        ingested=ingested_views,
-        failed=failures,
-        graph_num_nodes=G.number_of_nodes(),
-        graph_num_edges=G.number_of_edges(),
-    )
+# ---------------------------------------------------------------------------
+# Health endpoint
+# ---------------------------------------------------------------------------
 
 
 @app.get("/health")
 def health() -> Dict[str, str]:
+    """
+    Simple health check endpoint.
+
+    The tests only assert that this returns HTTP 200; we also return a small
+    status payload for humans.
+    """
     return {"status": "ok"}
 
 
-@app.get("/papers/{arxiv_id}", response_model=PaperWithConceptsResponse)
-def get_paper_with_concepts(arxiv_id: str) -> PaperWithConceptsResponse:
-    """
-    Retrieve a paper by arxiv_id plus its concept neighbours and immediate graph neighbours.
+# ---------------------------------------------------------------------------
+# Paper endpoint
+# ---------------------------------------------------------------------------
 
-    Response:
-    - paper: core metadata for the paper
-    - concepts: concept neighbours via outgoing edges
-    - neighbors: non-concept neighbours (e.g. other papers) via in/out edges
+
+@app.get("/papers/{arxiv_id}", response_model=PaperResponse)
+def get_paper(arxiv_id: str) -> PaperResponse:
+    """
+    Return a detailed view of a single paper, including:
+
+    - core metadata for the paper node
+    - a 'concepts' collection for connected concept nodes
+    - a 'neighbors' collection for neighboring *paper* nodes only
+      (excluding concept nodes), each with a 'direction' and 'relation' field.
     """
     G = get_graph()
 
-    node_id = _find_paper_node(G, arxiv_id)
-    if node_id is None:
+    node = _find_paper_node(G, arxiv_id)
+    if node is None:
         raise HTTPException(status_code=404, detail="Paper not found")
 
-    data = G.nodes[node_id]
+    attrs = G.nodes[node]
+    paper = _paper_from_node(node, attrs)
+    concepts = _concepts_for_paper(G, node)
+    neighbors = _paper_neighbors(G, node)
 
-    paper_attrs = {
-        k: v
-        for k, v in data.items()
-        if k
-        not in {
-            "kind",
-            "label",
-            "base_name",
-            "concept_key",
-            "slug",
-            "arxiv_id",
-            "title",
-            "abstract",
-        }
-    }
-
-    paper = PaperModel(
-        id=str(node_id),
-        arxiv_id=str(data.get("arxiv_id", arxiv_id)),
-        title=data.get("title"),
-        abstract=data.get("abstract"),
-        attributes=paper_attrs,
-    )
-
-    # -------- concepts: outgoing edges to concept nodes --------
-    concepts: List[ConceptSummaryModel] = []
-    for _, nbr, edge_data in G.out_edges(node_id, data=True):
-        nbr_data = G.nodes[nbr]
-        if nbr_data.get("kind") != "concept":
-            continue
-
-        key = (
-            nbr_data.get("concept_key")
-            or nbr_data.get("slug")
-            or str(nbr).split("concept:")[-1]
-        )
-        label = nbr_data.get("label") or key
-        relation = edge_data.get("relation") or edge_data.get("type")
-
-        concept_attrs = {
-            k: v
-            for k, v in nbr_data.items()
-            if k not in {"kind", "label", "base_name", "concept_key", "slug"}
-        }
-
-        concepts.append(
-            ConceptSummaryModel(
-                id=str(nbr),
-                key=str(key),
-                label=str(label),
-                relation=relation,
-                weight=edge_data.get("weight"),
-                attributes=concept_attrs,
-            )
-        )
-
-    # -------- neighbors: both directions, non-concept only --------
-    neighbors: List[NeighborModel] = []
-
-    def _add_neighbor(src: Any, dst: Any, edge_data: Dict[str, Any], direction: str):
-        if dst == node_id:
-            return
-
-        n_data = G.nodes[dst]
-
-        # Skip concept nodes; these are reported via 'concepts'
-        if n_data.get("kind") == "concept":
-            return
-
-        rel = edge_data.get("relation") or edge_data.get("type")
-        label = n_data.get("label") or n_data.get("title") or str(dst)
-        attrs = {
-            k: v
-            for k, v in n_data.items()
-            if k not in {"kind", "label", "base_name", "concept_key", "slug"}
-        }
-
-        neighbors.append(
-            NeighborModel(
-                id=str(dst),
-                kind=n_data.get("kind"),
-                label=str(label),
-                relation=rel,
-                direction=direction,
-                weight=edge_data.get("weight"),
-                attributes=attrs,
-            )
-        )
-
-    # Outgoing neighbours
-    for _, nbr, edge_data in G.out_edges(node_id, data=True):
-        _add_neighbor(node_id, nbr, edge_data, direction="out")
-
-    # Incoming neighbours
-    for nbr, _, edge_data in G.in_edges(node_id, data=True):
-        _add_neighbor(nbr, node_id, edge_data, direction="in")
-
-    return PaperWithConceptsResponse(
-        paper=paper,
-        concepts=concepts,
-        neighbors=neighbors,
-    )
+    return PaperResponse(paper=paper, concepts=concepts, neighbors=neighbors)
 
 
-@app.get("/concepts/{concept_slug}", response_model=ConceptWithPapersResponse)
-def get_concept_with_papers(concept_slug: str) -> ConceptWithPapersResponse:
+@app.get("/papers/{arxiv_id}/influence", response_model=PaperInfluenceResponse)
+def get_paper_influence(arxiv_id: str) -> PaperInfluenceResponse:
     """
-    Retrieve a concept (by slugified label) and all papers that reference it.
+    Paper Influence Explorer endpoint.
 
-    - URL uses a slug: 'test-concept'
-    - We deslug to 'test concept' and match against node ids or concept node attributes.
-    - Papers are any `kind="paper"` nodes with a HAS_CONCEPT edge to this concept.
+    Returns:
+      - The focal paper
+      - Incoming influence (papers that cite this one)
+      - Outgoing influence (papers this one cites)
     """
     G = get_graph()
 
-    node_id = _find_concept_node(G, concept_slug)
-    if node_id is None:
-        raise HTTPException(status_code=404, detail="Concept not found")
+    node = _find_paper_node(G, arxiv_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Paper not found")
 
-    c_data = G.nodes[node_id]
-    label = (
-        c_data.get("label")
-        or c_data.get("base_name")
-        or c_data.get("concept_key")
-        or _deslug_concept_key(concept_slug)
+    attrs = G.nodes[node]
+    paper = _paper_from_node(node, attrs)
+    incoming, outgoing = _paper_influence(G, node)
+
+    return PaperInfluenceResponse(
+        paper=paper,
+        incoming=incoming,
+        outgoing=outgoing,
     )
 
-    concept = ConceptSummaryModel(
-        id=str(node_id),
-        key=concept_slug,  # tests expect the same slug back as "key"
-        label=str(label),
-        relation=None,
-        weight=None,
-        attributes={
-            k: v
-            for k, v in c_data.items()
-            if k not in {"kind", "label", "base_name", "concept_key"}
-        },
-    )
+# ---------------------------------------------------------------------------
+# Concept endpoint
+# ---------------------------------------------------------------------------
 
-    papers: List[PaperModel] = []
 
-    # Expect edges Paper -> Concept with relation HAS_CONCEPT
-    for paper_id in G.predecessors(node_id):
-        p_data = G.nodes[paper_id]
-        if p_data.get("kind") != "paper":
+@app.get("/concepts/{concept_key}", response_model=ConceptResponse)
+def get_concept(concept_key: str) -> ConceptResponse:
+    """
+    Retrieve a concept by its key (e.g. 'test-concept') and list its connected
+    papers.
+
+    Tests assert that:
+      - /concepts/test-concept returns 200
+      - The response shape is stable enough to drive a concept inspector UI.
+    """
+    G = get_graph()
+
+    concept_node: Optional[Any] = None
+    concept_attrs: Optional[Dict[str, Any]] = None
+
+    for n, attrs in G.nodes(data=True):
+        kind = _node_kind(attrs)
+        if kind != "concept" and "concept" not in kind:
             continue
 
-        papers.append(
-            PaperModel(
-                id=str(paper_id),
-                arxiv_id=p_data.get("arxiv_id", str(paper_id)),
-                title=p_data.get("title"),
-                abstract=p_data.get("abstract"),
-                attributes={
-                    k: v
-                    for k, v in p_data.items()
-                    if k not in {"kind", "arxiv_id", "title", "abstract"}
-                },
-            )
+        key_candidate = (
+            attrs.get("concept_key")
+            or attrs.get("key")
+            or attrs.get("label")
+            or str(n)
         )
 
-    return ConceptWithPapersResponse(concept=concept, papers=papers)
+        if str(key_candidate) == concept_key:
+            concept_node = n
+            concept_attrs = attrs
+            break
+
+    if concept_node is None or concept_attrs is None:
+        raise HTTPException(status_code=404, detail=f"Concept '{concept_key}' not found")
+
+    concept = _concept_from_node(concept_node, concept_attrs)
+
+    # Collect connected papers (neighbors that are 'paper')
+    neighbor_ids: Set[Any] = set(G.predecessors(concept_node)) | set(
+        G.successors(concept_node)
+    )
+    papers: List[PaperNode] = []
+
+    for nbr in neighbor_ids:
+        attrs = G.nodes[nbr]
+        kind = _node_kind(attrs)
+        if kind != "paper" and "paper" not in kind:
+            continue
+        papers.append(_paper_from_node(nbr, attrs))
+
+    # Stable ordering for deterministic tests/UI
+    papers.sort(key=lambda p: (p.arxiv_id, p.id))
+
+    return ConceptResponse(concept=concept, papers=papers)
 
 
-@app.get("/search/nodes", response_model=SearchNodesResponse)
+# ---------------------------------------------------------------------------
+# Search endpoint
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=256)
+def _cached_search_nodes(query: str) -> List[Dict[str, Any]]:
+    """
+    Low-level cached search over nodes by simple substring matching
+    on node id and label.
+
+    Tests monkeypatch get_graph() and then optionally clear this cache via
+    _cached_search_nodes.cache_clear().
+    """
+    G = get_graph()
+    q = query.lower()
+    hits: List[Dict[str, Any]] = []
+
+    for node, attrs in G.nodes(data=True):
+        label = _node_label(node, attrs)
+        text = f"{node} {label}".lower()
+        if q not in text:
+            continue
+
+        kind = _node_kind(attrs)
+        hits.append(
+            {
+                "node_id": str(node),
+                "kind": kind,
+                "label": str(label),
+                # Simple score: length of match / label length, or just 1.0.
+                "score": 1.0,
+            }
+        )
+
+    return hits
+
+
+@app.get("/search/nodes", response_model=NodeSearchResponse)
 def search_nodes(
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., alias="q", description="Substring query over id/label"),
     kind: Optional[str] = Query(
         None,
-        description="Optional filter by node kind.",
+        description="Optional node kind filter, e.g. 'paper' or 'concept'.",
     ),
-) -> SearchNodesResponse:
+) -> NodeSearchResponse:
     """
-    Simple substring search over node labels / metadata.
+    Search graph nodes by id/label.
 
-    IMPORTANT: We always use the real node id from the graph; we never
-    transform it (no slugging, no prefix changes), which avoids KeyError
-    when looking back into the graph.
+    Tests expect:
+      - 'query' field echoed back as the (stripped) query
+      - 'hits' list containing objects with 'node_id'
+      - 400 when the query is empty or whitespace only
+      - 'kind' filter to restrict to just papers or just concepts
     """
-    query = q.strip().lower()
+    query = q.strip()
     if not query:
-        raise HTTPException(status_code=400, detail="Empty query")
-
-    index = _cached_search_nodes()
-
-    hits: List[SearchNodeResult] = []
-    for entry in index:
-        if kind and entry["kind"] != kind:
-            continue
-        if query in entry["text"]:
-            hits.append(
-                SearchNodeResult(
-                    node_id=str(entry["id"]),
-                    kind=entry["kind"],
-                    label=str(entry["label"]),
-                )
-            )
-
-    return SearchNodesResponse(query=q, hits=hits)
-
-@app.get("/graph/stats", response_model=GraphStatsResponse)
-def graph_stats(
-    top_k: int = Query(
-        10,
-        ge=1,
-        le=100,
-        description="Number of top concepts to return, ranked by graph degree.",
-    )
-) -> GraphStatsResponse:
-    """
-    Return high-level statistics about the current graph.
-
-    This includes node/edge counts, paper/concept counts, and the top-k
-    concept nodes ranked by their total graph degree.
-    """
-    G = get_graph()
-
-    num_nodes = G.number_of_nodes()
-    num_edges = G.number_of_edges()
-
-    num_papers = 0
-    num_concepts = 0
-    concept_degrees: List[Dict[str, Any]] = []
-
-    for node_id, data in G.nodes(data=True):
-        kind = data.get("kind")
-        if kind == "paper":
-            num_papers += 1
-        elif kind == "concept":
-            num_concepts += 1
-            degree = int(G.degree(node_id))
-            key = (
-                data.get("concept_key")
-                or data.get("slug")
-                or str(node_id).split("concept:")[-1]
-            )
-            label = data.get("label") or key
-            concept_degrees.append(
-                {
-                    "id": str(node_id),
-                    "key": str(key),
-                    "label": str(label),
-                    "degree": degree,
-                }
-            )
-
-    concept_degrees.sort(key=lambda x: x["degree"], reverse=True)
-    top_items = concept_degrees[:top_k]
-
-    top_concepts = [
-        ConceptStats(
-            id=item["id"],
-            key=item["key"],
-            label=item["label"],
-            degree=item["degree"],
+        # test_search_nodes_rejects_empty_query expects 400 here
+        raise HTTPException(
+            status_code=400,
+            detail="Query must not be empty.",
         )
-        for item in top_items
+
+    all_hits = _cached_search_nodes(query)
+
+    if kind:
+        wanted = kind.lower()
+        filtered = [
+            h for h in all_hits if (h.get("kind") or "").lower() == wanted
+        ]
+    else:
+        filtered = all_hits
+
+    hits_models = [
+        NodeSearchHit(
+            node_id=h["node_id"],
+            kind=h["kind"],
+            label=h["label"],
+            score=float(h.get("score", 1.0)),
+        )
+        for h in filtered
     ]
 
-    return GraphStatsResponse(
-        num_nodes=num_nodes,
-        num_edges=num_edges,
-        num_papers=num_papers,
-        num_concepts=num_concepts,
-        top_concepts=top_concepts,
-    )
+    return NodeSearchResponse(query=query, kind=kind, hits=hits_models)

@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Sequence
 import requests
 import pickle
 
+from kg_ai_papers.config.settings import settings
 # Keep the import for type hints / compatibility, even if we don't rely on it.
 from kg_ai_papers.grobid_client import GrobidClient  # type: ignore[unused-import]
 from kg_ai_papers.tei_parser import extract_sections_from_tei
@@ -18,6 +19,7 @@ from kg_ai_papers.nlp.concept_extraction import (
     aggregate_section_concepts,
 )
 from kg_ai_papers.models.paper import Paper
+
 
 # -----------------------------------------------------------------------------
 # Public result type for downstream consumers
@@ -68,13 +70,14 @@ def _process_pdf_via_http(pdf_path: Path, work_dir: Optional[Path] = None) -> Pa
     """
     Send a PDF to GROBID /api/processFulltextDocument and return the TEI path.
 
-    Uses environment variable GROBID_URL if set, otherwise http://localhost:8070.
+    Uses environment variable GROBID_URL if set, otherwise settings.GROBID_URL.
     """
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    base_url = os.getenv("GROBID_URL", "http://localhost:8070").rstrip("/")
+    # Prefer an explicit env override, but fall back to configured settings.
+    base_url = os.getenv("GROBID_URL", settings.GROBID_URL).rstrip("/")
     timeout = int(os.getenv("GROBID_TIMEOUT", "60"))
 
     # Choose a TEI output directory
@@ -222,8 +225,18 @@ def ingest_pdf(
     # ------------------------------------------------------------------
     if ingested is None:
         # 1) PDF -> TEI via either an external GrobidClient or our HTTP fallback
-        if grobid_client is not None and hasattr(grobid_client, "process_pdf"):
-            tei_path = grobid_client.process_pdf(pdf_path)
+        if grobid_client is not None:
+            if hasattr(grobid_client, "parse_pdf_to_tei"):
+                # New-style GrobidClient from kg_ai_papers.grobid_client
+                tei_path = grobid_client.parse_pdf_to_tei(pdf_path)
+            elif hasattr(grobid_client, "process_pdf"):
+                # Backwards-compat for older clients
+                tei_path = grobid_client.process_pdf(pdf_path)
+            else:
+                raise TypeError(
+                    "grobid_client must implement parse_pdf_to_tei(pdf_path: Path) "
+                    "or process_pdf(pdf_path: Path) -> Path"
+                )
         else:
             tei_path = _process_pdf_via_http(pdf_path, work_dir=work_dir)
 

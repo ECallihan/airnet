@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kg-ai-papers"
+version = "0.1.0"
+description = "Knowledge graph for AI research papers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+
+authors = [
+  { name = "Edward Callihan" }
+]
+
+# This is your old install_requires
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "pydantic",
+  "pydantic-settings",
+  "networkx",
+  "sentence-transformers",
+  "keybert",
+  "rapidfuzz",
+  "arxiv",
+  "requests",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+# from [options.extras_require]
+dev = [
+  "pytest",
+  "pytest-cov",
+  "black",
+  "isort",
+  "mypy",
+]
+
+[project.urls]
+Homepage = "https://example.com/your-repo"
+
+# CLI entry points (console_scripts)
+[project.scripts]
+airnet-batch = "kg_ai_papers.cli.batch_ingest:app"
+airnet-query = "kg_ai_papers.cli.query_cli:app"
+airnet-pipeline = "kg_ai_papers.cli.pipeline_cli:app"
+
+# setuptools package discovery (replaces [options] + [options.packages.find])
+[tool.setuptools]
+package-dir = { "" = "." }
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests"]
+
+# pytest configuration (replaces [tool:pytest] in setup.cfg)
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = [
+  "integration: marks tests as integration tests that may require external services (e.g. GROBID)",
+]

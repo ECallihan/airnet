@@ -3,7 +3,7 @@ from __future__ import annotations
 from enum import Enum
 from pathlib import Path
 from typing import Optional
-
+import multiprocessing
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -28,6 +28,11 @@ class Settings(BaseSettings):
         extra="ignore",
         env_nested_delimiter="__",
         env_prefix="AIRNET_"
+    )
+
+    grobid_url: str = Field(
+        default="http://localhost:8070",
+        description="Base URL for GROBID service.",
     )
 
 
@@ -159,6 +164,22 @@ class Settings(BaseSettings):
         default=None,
         description="API key for header-based auth. If None, auth is disabled.",
     )
+
+    # How many parallel GROBID requests to run
+    grobid_max_workers: int = Field(
+        default=max(1, multiprocessing.cpu_count() // 2),
+        description="Max concurrent GROBID requests."
+    )
+
+    # How many papers to process concurrently in ingestion
+    ingest_max_workers: int = Field(
+        default=max(1, multiprocessing.cpu_count() // 2),
+        description="Max concurrent paper ingestion workers."
+    )
+
+    # NLP / embedding batch size, if you’re batching
+    nlp_batch_size: int = 16
+
 
     # ------------------------------------------------------------------
     # Convenience derived paths

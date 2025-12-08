@@ -1,5 +1,3 @@
-# kg_ai_papers/cli/query_cli.py
-
 from __future__ import annotations
 
 from pathlib import Path
@@ -103,6 +101,76 @@ def _iter_concept_nodes(graph: nx.MultiDiGraph) -> List[Tuple[Any, Dict[str, Any
 # Commands
 # ---------------------------------------------------------------------------
 
+@app.command("search")
+def search(
+    query: str = typer.Argument(
+        ..., help="Search text to match against node ids and labels."
+    ),
+    kind: Optional[str] = typer.Option(
+        None,
+        "--kind",
+        "-k",
+        help="Optional node kind filter (e.g. 'paper', 'concept').",
+    ),
+    limit: int = typer.Option(
+        50,
+        "--limit",
+        "-n",
+        min=1,
+        help="Max number of hits to display.",
+    ),
+    graph_file: Optional[Path] = typer.Option(
+        None,
+        "--graph-file",
+        "-g",
+        help=(
+            "Path to a saved graph file. "
+            "If omitted, the latest graph in settings.graph_dir is used."
+        ),
+    ),
+) -> None:
+    """
+    Search nodes by label or id, optionally filtered by kind.
+    """
+    G = _load_graph(graph_file)
+
+    q = query.lower()
+    kind_filter = kind.lower().strip() if kind else None
+
+    hits: List[Tuple[str, str, str]] = []
+    for node, attrs in G.nodes(data=True):
+        node_id = str(node)
+        node_kind, label = _node_kind_and_label(G, node)
+
+        if kind_filter and node_kind != kind_filter:
+            continue
+
+        if q in node_id.lower() or q in label.lower():
+            hits.append((node_id, node_kind, label))
+
+        if len(hits) >= limit:
+            break
+
+    if not hits:
+        console.print(f"[yellow]No matches for '{query}'.[/yellow]")
+        return
+
+    console.print(
+        f"[bold]Search results for '{query}'"
+        f"{f' (kind={kind_filter})' if kind_filter else ''}:[/bold]"
+    )
+
+    tbl = Table(show_header=True, header_style="bold")
+    tbl.add_column("Node id")
+    tbl.add_column("Kind")
+    tbl.add_column("Label")
+
+    for node_id, node_kind, label in hits:
+        tbl.add_row(node_id, node_kind, label)
+
+    console.print(tbl)
+
+
 @app.command("paper")
 def paper(
     arxiv_id: str = typer.Argument(
@@ -157,12 +225,10 @@ def paper(
         f"{paper_summary.title or '(no title)'}"
     )
 
-    # PaperSummary may or may not expose an abstract; access defensively.
     abstract = getattr(paper_summary, "abstract", None)
     if abstract:
         console.print(f"[dim]{abstract}[/dim]\n")
 
-    # Concepts
     console.print("[bold]Top concepts:[/bold]")
     if not view.concepts:
         console.print("  (none)")
@@ -182,7 +248,6 @@ def paper(
 
         console.print(tbl)
 
-    # Influential references
     console.print("\n[bold]Influential references (papers this one cites):[/bold]")
     refs = getattr(view, "influential_references", None) or []
     if not refs:
@@ -196,7 +261,6 @@ def paper(
                 f"(influence_score={r.influence_score:.3f})"
             )
 
-    # Influenced papers
     console.print("\n[bold]Papers influenced by this one:[/bold]")
     influenced = getattr(view, "influenced_papers", None) or []
     if not influenced:
@@ -240,7 +304,6 @@ def neighbors(
         console.print(f"[red]Paper '{arxiv_id}' not found in graph.[/red]")
         raise typer.Exit(code=1)
 
-    # Simple BFS over undirected view (in+out neighbors)
     visited = {start}
     frontier: List[Tuple[Any, int]] = [(start, 0)]
     results: List[Tuple[Any, int]] = []
