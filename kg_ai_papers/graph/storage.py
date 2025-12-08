@@ -87,6 +87,40 @@ def save_graph(
     return path
 
 
+def load_graph(
+    name: str,
+    directory: Optional[Path] = None,
+) -> nx.MultiDiGraph:
+    """
+    Load a specific pickled graph by name.
+
+    - If ``name`` is an absolute path or already points to a file, that
+      path is used directly.
+    - Otherwise, it is resolved relative to the given ``directory`` (or
+      the module-level GRAPH_DIR if ``directory`` is None).
+
+    This is mainly used by the pipeline CLI, which passes a graph name
+    like 'graph-20251207-120000.pkl'.
+    """
+    # If caller gives a full path, prefer it directly.
+    path = Path(name)
+
+    if not path.is_absolute():
+        # Fall back to our standard graph directory if no directory is given.
+        directory = _ensure_dir(directory)
+        path = directory / name
+
+    # Let FileNotFoundError bubble up to callers (pipeline_cli catches it).
+    with path.open("rb") as f:
+        G = pickle.load(f)
+
+    if not isinstance(G, nx.MultiDiGraph):
+        # Keep the type flexible but satisfy type checkers.
+        return G  # type: ignore[return-value]
+
+    return G
+
+
 def load_latest_graph(directory: Optional[Path] = None) -> Optional[nx.MultiDiGraph]:
     """
     Load the most recently modified pickled graph file from the target directory.

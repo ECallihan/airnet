@@ -215,3 +215,17 @@ def extract_references_from_tei(tei_path: Path | str) -> List[str]:
             results.append(arxiv_id)
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Backwards-compatible aliases expected by kg_ai_papers.parsing.pipeline
+# ---------------------------------------------------------------------------
+
+def parse_sections(tei_path: Path | str) -> List[PaperSection]:
+    """Compatibility wrapper around extract_sections_from_tei."""
+    return extract_sections_from_tei(tei_path)
+
+
+def parse_references(tei_path: Path | str) -> List[str]:
+    """Compatibility wrapper around extract_references_from_tei."""
+    return extract_references_from_tei(tei_path)

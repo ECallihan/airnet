@@ -1,209 +1,332 @@
+# kg_ai_papers/cli/query_cli.py
+
+from __future__ import annotations
+
 from pathlib import Path
-import pickle
+from typing import Any, Dict, List, Optional, Tuple
 
 import networkx as nx
 import typer
-from rich import print
-
 from rich.console import Console
 from rich.table import Table
 
-from kg_ai_papers.api.query import (
-    get_paper_concepts,
-    get_paper_influence_view,
+from kg_ai_papers.api.query import get_paper_influence_view
+from kg_ai_papers.graph.builder import paper_node_id
+from kg_ai_papers.graph.io import load_graph as load_graph_file
+from kg_ai_papers.graph.storage import load_latest_graph
+from kg_ai_papers.config.settings import settings
+
+app = typer.Typer(
+    help="Read/query utilities over a saved AirNet knowledge graph."
 )
-from kg_ai_papers.models.paper import Paper
+
+console = Console()
 
 
-GRAPH_PATH = Path("data/graph/graph.gpickle")
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-
-def _load_graph():
+def _load_graph(graph_file: Optional[Path]) -> nx.MultiDiGraph:
     """
-    Load the knowledge graph from disk if it exists.
-    Returns a networkx.MultiDiGraph or None.
+    Load a saved graph.
+
+    If --graph-file is provided, that exact file is loaded.
+    Otherwise, we try to load the 'latest' graph from settings.graph_dir.
     """
-    if not GRAPH_PATH.exists():
-        return None
+    if graph_file is not None:
+        path = Path(graph_file)
+        if not path.exists():
+            console.print(f"[red]Graph file not found:[/red] {path}")
+            raise typer.Exit(code=1)
+        return load_graph_file(path)  # type: ignore[return-value]
 
-    with GRAPH_PATH.open("rb") as f:
-        G = pickle.load(f)
-    return G
+    # Fallback: use the latest graph in the configured graph directory.
+    G = load_latest_graph(settings.graph_dir)
+    if G is None:
+        console.print(
+            f"[red]No graph found in {settings.graph_dir}.[/red]\n"
+            "Run the ingestion/pipeline first, or pass --graph-file."
+        )
+        raise typer.Exit(code=1)
 
-
-
-app = typer.Typer(help="Query the AI paper knowledge graph.")
-
-
-# ----------------------------------------------------------------------
-# LIST COMMAND
-# ----------------------------------------------------------------------
-@app.command("list")
-def list_papers():
-    """List all papers currently in the graph."""
-    G = _load_graph()
-    if G is None or G.number_of_nodes() == 0:
-        print("[red]No papers found in the graph yet.[/red]")
-        return
-
-    rows = []
-
-    # Heuristic: treat any node that has a "title" as a paper node.
-    # Prefer the explicit `arxiv_id` attribute if present; otherwise use the node id.
-    for node_id, data in G.nodes(data=True):
-        title = data.get("title")
-        if not title:
-            continue  # likely a concept or other node type
-
-        arxiv_id = data.get("arxiv_id", node_id)
-        rows.append((str(arxiv_id), str(title)))
-
-    if not rows:
-        print("[red]No papers found in the graph yet.[/red]")
-        return
-
-    # Sort by arxiv_id for nicer output
-    rows.sort(key=lambda r: r[0])
-
-    table = Table(title="Papers in Knowledge Graph")
-    table.add_column("arXiv ID", style="cyan", no_wrap=True)
-    table.add_column("Title", style="magenta")
-
-    for arxiv_id, title in rows:
-        table.add_row(arxiv_id, title)
-
-    console = Console()
-    console.print(table)
+    return G  # type: ignore[return-value]
 
 
-# ----------------------------------------------------------------------
-# PAPER COMMAND (FULL DETAILS)
-# ----------------------------------------------------------------------
+def _find_paper_node(graph: nx.MultiDiGraph, arxiv_id: str) -> Optional[Any]:
+    """
+    Robustly find the node corresponding to this paper id in different graph flavors:
+      - node id == paper_node_id(arxiv_id) (e.g. 'paper:p1')
+      - node id == arxiv_id
+      - node with node['arxiv_id'] == arxiv_id or node['paper_id'] == arxiv_id
+    """
+    node = paper_node_id(arxiv_id)
+    if node in graph:
+        return node
+
+    if arxiv_id in graph:
+        return arxiv_id
+
+    for n, attrs in graph.nodes(data=True):
+        if attrs.get("arxiv_id") == arxiv_id or attrs.get("paper_id") == arxiv_id:
+            return n
+
+    return None
+
+
+def _node_kind_and_label(graph: nx.MultiDiGraph, node: Any) -> Tuple[str, str]:
+    attrs: Dict[str, Any] = graph.nodes[node]
+    kind = str(attrs.get("type") or attrs.get("kind") or "").lower() or "unknown"
+
+    label = (
+        attrs.get("title")
+        or attrs.get("label")
+        or attrs.get("name")
+        or attrs.get("concept_key")
+        or str(node)
+    )
+
+    return kind, str(label)
+
+
+def _iter_concept_nodes(graph: nx.MultiDiGraph) -> List[Tuple[Any, Dict[str, Any]]]:
+    concepts: List[Tuple[Any, Dict[str, Any]]] = []
+    for n, attrs in graph.nodes(data=True):
+        type_str = str(attrs.get("type", "")).lower()
+        kind_str = str(attrs.get("kind", "")).lower()
+        if type_str == "concept" or "concept" in kind_str:
+            concepts.append((n, attrs))
+    return concepts
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
 @app.command("paper")
 def paper(
-    arxiv_id: str = typer.Argument(..., help="arXiv id of the paper"),
-    top: int = typer.Option(10, "--top", help="Top N concepts/references/influenced papers to show"),
-):
-    """Show a high-level influence view for a single paper."""
-    G = _load_graph()
-    if G is None:
-        print("[red]No graph found. Run the pipeline first.[/red]")
+    arxiv_id: str = typer.Argument(
+        ..., help="arXiv id / paper id (e.g. 2401.12345 or p1)."
+    ),
+    graph_file: Optional[Path] = typer.Option(
+        None,
+        "--graph-file",
+        "-g",
+        help=(
+            "Path to a saved graph pickle. "
+            "If omitted, the latest graph in settings.graph_dir is used."
+        ),
+    ),
+    top_k_concepts: int = typer.Option(
+        10,
+        "--top-k-concepts",
+        help="Max number of concepts to show.",
+    ),
+    top_k_references: int = typer.Option(
+        10,
+        "--top-k-refs",
+        help="Max number of influential references to show.",
+    ),
+    top_k_influenced: int = typer.Option(
+        10,
+        "--top-k-influenced",
+        help="Max number of papers influenced by this one.",
+    ),
+) -> None:
+    """
+    Show a compact influence/concept view for a single paper.
+    """
+    G = _load_graph(graph_file)
+
+    view = get_paper_influence_view(
+        G,
+        arxiv_id,
+        top_k_concepts=top_k_concepts,
+        top_k_references=top_k_references,
+        top_k_influenced=top_k_influenced,
+    )
+
+    if view is None or view.paper is None:
+        console.print(f"[red]Paper '{arxiv_id}' not found in graph.[/red]")
         raise typer.Exit(code=1)
 
-    try:
-        view = get_paper_influence_view(
-            G,
-            arxiv_id=arxiv_id,
-            top_k_concepts=top,
-            top_k_references=top,
-            top_k_influenced=top,
-        )
-    except Exception as e:
-        print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(code=1)
+    paper_summary = view.paper
 
-    # Example pretty-print (adjust if you already have something):
-    console = Console()
-    console.print(f"[bold]Paper:[/bold] {view.paper.arxiv_id} — {view.paper.title}")
+    console.print(
+        f"[bold]Paper {paper_summary.arxiv_id}[/bold]: "
+        f"{paper_summary.title or '(no title)'}"
+    )
 
-    console.print("\n[bold]Top concepts:[/bold]")
-    for c in view.concepts:
-        console.print(f"  • {c.label} (weight={c.weight:.3f})")
+    # PaperSummary may or may not expose an abstract; access defensively.
+    abstract = getattr(paper_summary, "abstract", None)
+    if abstract:
+        console.print(f"[dim]{abstract}[/dim]\n")
 
-    console.print("\n[bold]Most influential references:[/bold]")
-    for r in view.references:
-        console.print(
-            f"  • {r.arxiv_id} — {r.title} "
-            f"(influence_score={r.influence_score:.3f}, similarity={r.similarity:.3f})"
-        )
-
-    console.print("\n[bold]Papers influenced by this one:[/bold]")
-    if not view.influenced:
+    # Concepts
+    console.print("[bold]Top concepts:[/bold]")
+    if not view.concepts:
         console.print("  (none)")
     else:
-        for r in view.influenced:
+        tbl = Table(show_header=True, header_style="bold")
+        tbl.add_column("Concept")
+        tbl.add_column("Weight", justify="right")
+        tbl.add_column("Details")
+
+        for c in view.concepts:
+            weight = getattr(c, "weight", None)
+            weight_str = f"{weight:.3f}" if isinstance(weight, (int, float)) else ""
+            details = []
+            if getattr(c, "mentions_total", None) is not None:
+                details.append(f"mentions={c.mentions_total}")
+            tbl.add_row(c.label, weight_str, ", ".join(details))
+
+        console.print(tbl)
+
+    # Influential references
+    console.print("\n[bold]Influential references (papers this one cites):[/bold]")
+    refs = getattr(view, "influential_references", None) or []
+    if not refs:
+        console.print("  (none)")
+    else:
+        for r in refs:
+            title = getattr(r, "title", "")
+            title_part = f" — {title}" if title else ""
             console.print(
-                f"  • {r.arxiv_id} — {r.title} "
-                f"(influence_score={r.influence_score:.3f}, similarity={r.similarity:.3f})"
+                f"  • {r.arxiv_id}{title_part} "
+                f"(influence_score={r.influence_score:.3f})"
+            )
+
+    # Influenced papers
+    console.print("\n[bold]Papers influenced by this one:[/bold]")
+    influenced = getattr(view, "influenced_papers", None) or []
+    if not influenced:
+        console.print("  (none)")
+    else:
+        for r in influenced:
+            title = getattr(r, "title", "")
+            title_part = f" — {title}" if title else ""
+            console.print(
+                f"  • {r.arxiv_id}{title_part} "
+                f"(influence_score={r.influence_score:.3f})"
             )
 
 
-# ----------------------------------------------------------------------
-# CONCEPTS COMMAND
-# ----------------------------------------------------------------------
-@app.command("concepts")
-def concepts(
-    arxiv_id: str = typer.Argument(..., help="arXiv id of the paper"),
-    top: int = typer.Option(10, "--top", help="Top N concepts to show"),
-):
-    """Show the top concepts for a given paper."""
-    G = _load_graph()
-    if G is None:
-        print("[red]No graph found in data/graph yet. Run the pipeline first.[/red]")
+@app.command("neighbors")
+def neighbors(
+    arxiv_id: str = typer.Argument(
+        ..., help="arXiv id / paper id whose neighborhood to inspect."
+    ),
+    depth: int = typer.Option(
+        1,
+        "--depth",
+        "-d",
+        min=1,
+        help="Graph distance to traverse (1 = direct neighbors).",
+    ),
+    graph_file: Optional[Path] = typer.Option(
+        None,
+        "--graph-file",
+        "-g",
+        help="Path to a saved graph pickle.",
+    ),
+) -> None:
+    """
+    Show the neighborhood around a paper up to a given depth.
+    """
+    G = _load_graph(graph_file)
+    start = _find_paper_node(G, arxiv_id)
+
+    if start is None:
+        console.print(f"[red]Paper '{arxiv_id}' not found in graph.[/red]")
         raise typer.Exit(code=1)
 
-    try:
-        concepts = get_paper_concepts(G, arxiv_id, top)
-    except Exception as e:
-        print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(code=1)
+    # Simple BFS over undirected view (in+out neighbors)
+    visited = {start}
+    frontier: List[Tuple[Any, int]] = [(start, 0)]
+    results: List[Tuple[Any, int]] = []
 
-    console = Console()
-    console.print(f"[bold]Top concepts for {arxiv_id}[/bold]")
-    if not concepts:
-        console.print("  (no concepts found)")
+    while frontier:
+        node, d = frontier.pop(0)
+        if d >= depth:
+            continue
+
+        neighbors_set = set(G.predecessors(node)) | set(G.successors(node))
+        for nbr in neighbors_set:
+            if nbr in visited:
+                continue
+            visited.add(nbr)
+            nd = d + 1
+            results.append((nbr, nd))
+            frontier.append((nbr, nd))
+
+    console.print(
+        f"[bold]Neighbors of '{arxiv_id}'[/bold] "
+        f"(graph node {start}, depth ≤ {depth}):"
+    )
+
+    if not results:
+        console.print("  (no neighbors)")
         return
 
-    for c in concepts:
-        console.print(f"  • {c.label} (weight={c.weight:.3f})")
+    tbl = Table(show_header=True, header_style="bold")
+    tbl.add_column("Node id")
+    tbl.add_column("Kind")
+    tbl.add_column("Label")
+    tbl.add_column("Depth", justify="right")
+
+    for node, d in sorted(results, key=lambda x: x[1]):
+        kind, label = _node_kind_and_label(G, node)
+        tbl.add_row(str(node), kind, label, str(d))
+
+    console.print(tbl)
 
 
-# ----------------------------------------------------------------------
-# INFLUENCE COMMAND
-# ----------------------------------------------------------------------
-@app.command("influence")
-def influence(
-    arxiv_id: str = typer.Argument(..., help="arXiv id of the paper"),
-    top: int = typer.Option(10, "--top", help="Top N concepts/references/influenced papers to show"),
-):
-    """Show the influence view for a paper (concepts + refs + influenced papers)."""
-    G = _load_graph()
-    if G is None:
-        print("[red]No graph found. Run the pipeline first.[/red]")
-        raise typer.Exit(code=1)
+@app.command("top-concepts")
+def top_concepts(
+    limit: int = typer.Option(
+        10,
+        "--limit",
+        "-k",
+        min=1,
+        help="Number of top concepts to show (by graph degree).",
+    ),
+    graph_file: Optional[Path] = typer.Option(
+        None,
+        "--graph-file",
+        "-g",
+        help="Path to a saved graph pickle.",
+    ),
+) -> None:
+    """
+    Show the highest-degree concept nodes in the graph.
+    """
+    G = _load_graph(graph_file)
 
-    try:
-        view = get_paper_influence_view(
-            G,
-            arxiv_id=arxiv_id,
-            top_k_concepts=top,
-            top_k_references=top,
-            top_k_influenced=top,
+    items: List[Tuple[Any, str, int]] = []
+    for n, attrs in _iter_concept_nodes(G):
+        degree = int(G.degree(n))
+        label = (
+            attrs.get("label")
+            or attrs.get("name")
+            or attrs.get("concept_key")
+            or str(n)
         )
-    except Exception as e:
-        print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(code=1)
+        items.append((n, str(label), degree))
 
-    console = Console()
-    console.print(f"[bold]Paper:[/bold] {view.paper.arxiv_id} — {view.paper.title}")
+    if not items:
+        console.print("[yellow]No concept nodes found in graph.[/yellow]")
+        return
 
-    console.print("\n[bold]Top concepts:[/bold]")
-    for c in view.concepts:
-        console.print(f"  • {c.label} (weight={c.weight:.3f})")
+    items.sort(key=lambda x: x[2], reverse=True)
+    items = items[:limit]
 
-    console.print("\n[bold]Most influential references:[/bold]")
-    for r in view.references:
-        console.print(
-            f"  • {r.arxiv_id} — {r.title} "
-            f"(influence_score={r.influence_score:.3f}, similarity={r.similarity:.3f})"
-        )
+    console.print(f"[bold]Top {len(items)} concepts by degree:[/bold]")
+    tbl = Table(show_header=True, header_style="bold")
+    tbl.add_column("Node id")
+    tbl.add_column("Label")
+    tbl.add_column("Degree", justify="right")
 
-    console.print("\n[bold]Papers influenced by this one:[/bold]")
-    if not view.influenced:
-        console.print("  (none)")
-    else:
-        for r in view.influenced:
-            console.print(
-                f"  • {r.arxiv_id} — {r.title} "
-                f"(influence_score={r.influence_score:.3f}, similarity={r.similarity:.3f})"
-            )
+    for node, label, degree in items:
+        tbl.add_row(str(node), label, str(degree))
+
+    console.print(tbl)

@@ -179,6 +179,16 @@ def main(
             "for debugging / inspection."
         ),
     ),
+    use_cache: bool = typer.Option(
+        True,
+        "--cache/--no-cache",
+        help="Enable or disable ingestion cache (PDF/TEI/concepts).",
+    ),
+    force_reingest: bool = typer.Option(
+        False,
+        "--force-reingest",
+        help="Ignore cached ingestion results and recompute for all papers.",
+    ),
 ) -> None:
     """
     Ingest a batch of arXiv papers and build a citation/concept graph.
@@ -205,6 +215,8 @@ def main(
             result = ingest_arxiv_paper(
                 arxiv_id=arxiv_id,
                 work_dir=work_dir,
+                use_cache=use_cache,
+                force_reingest=force_reingest,
             )
         except Exception as exc:  # noqa: BLE001
             typer.echo(f"  !! Failed to ingest {arxiv_id}: {exc!r}", err=True)

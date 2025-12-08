@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 import requests
+import pickle
 
 # Keep the import for type hints / compatibility, even if we don't rely on it.
 from kg_ai_papers.grobid_client import GrobidClient  # type: ignore[unused-import]
@@ -121,24 +122,49 @@ def ingest_pdf(
     grobid_client: Optional[Any] = None,
     neo4j_session: Optional[Any] = None,
     work_dir: Optional[Path] = None,
-    **_: Any,  # absorb any unexpected kwargs for backwards compatibility
+    use_cache: bool = True,
+    force_reingest: bool = False,
+    **_: Any,  # absorb unexpected kwargs for backwards compatibility
 ) -> IngestedPaper:
     """
-    End-to-end ingestion for a single PDF:
+    End-to-end ingestion for a single PDF.
 
-      PDF -> (GROBID) -> TEI
-          -> (tei_parser) -> sections
-          -> (concept_extraction) -> section concepts + aggregated concept summaries
-          -> (optional) persist to Neo4j
+    Pipeline:
+        PDF -> (GROBID) -> TEI
+             -> (tei_parser) -> sections
+             -> (concept_extraction) -> SectionConcepts
+             -> aggregate_section_concepts -> ConceptSummary per concept
+             -> (optional) persist to Neo4j
 
     Call patterns supported:
 
-      - ingest_pdf(pdf_path, arxiv_id=..., grobid_client=...)
-      - ingest_pdf(arxiv_id=..., grobid_client=..., work_dir=...)
-      - ingest_pdf(pdf_path)  # everything inferred
+        ingest_pdf(pdf_path, arxiv_id=..., grobid_client=...)
+        ingest_pdf(arxiv_id=..., grobid_client=..., work_dir=...)
+        ingest_pdf(pdf_path)  # everything inferred
 
     If pdf_path is not provided, we derive it as work_dir / f"{arxiv_id}.pdf".
     If that file does not exist, we try to download it from arXiv.
+
+    Caching
+    -------
+    We cache the full IngestedPaper object to disk so repeated runs do not
+    hit GROBID or the NLP stack again.
+
+    Cache location (per paper):
+
+        <base_dir>/cache/ingested/<paper_id>.pkl
+
+    where base_dir is work_dir if given, else pdf_path.parent, and paper_id is
+    arxiv_id if available, otherwise pdf_path.stem.
+
+    Parameters
+    ----------
+    use_cache:
+        If True (default), try to load from / write to cache.
+        If False, never read or write cache (always recompute).
+    force_reingest:
+        If True, ignore existing cache and recompute. If use_cache is also
+        True, the new result overwrites the old cache.
     """
     # Infer pdf_path if only arxiv_id + work_dir were given
     if pdf_path is None:
@@ -168,31 +194,69 @@ def ingest_pdf(
         else:
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    # 1) PDF -> TEI via either an external GrobidClient or our HTTP fallback
-    if grobid_client is not None and hasattr(grobid_client, "process_pdf"):
-        tei_path = grobid_client.process_pdf(pdf_path)
+    # ------------------------------------------------------------------
+    # Ingestion cache
+    # ------------------------------------------------------------------
+    ingested: Optional[IngestedPaper] = None
+
+    if use_cache:
+        base_dir = work_dir if work_dir is not None else pdf_path.parent
+        cache_dir = base_dir / "cache" / "ingested"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_key = arxiv_id or pdf_path.stem
+        cache_path = cache_dir / f"{cache_key}.pkl"
+
+        if cache_path.exists() and not force_reingest:
+            try:
+                with cache_path.open("rb") as f:
+                    loaded = pickle.load(f)
+                if isinstance(loaded, IngestedPaper) and loaded.arxiv_id == arxiv_id:
+                    ingested = loaded
+            except Exception:
+                ingested = None
     else:
-        tei_path = _process_pdf_via_http(pdf_path, work_dir=work_dir)
+        cache_path = None  # type: ignore[assignment]
 
-    # 2) TEI -> sections
-    sections = extract_sections_from_tei(tei_path)
+    # ------------------------------------------------------------------
+    # If no usable cache, run the full pipeline.
+    # ------------------------------------------------------------------
+    if ingested is None:
+        # 1) PDF -> TEI via either an external GrobidClient or our HTTP fallback
+        if grobid_client is not None and hasattr(grobid_client, "process_pdf"):
+            tei_path = grobid_client.process_pdf(pdf_path)
+        else:
+            tei_path = _process_pdf_via_http(pdf_path, work_dir=work_dir)
 
-    # 3) sections -> per-section concepts
-    # NOTE: concept_extraction currently expects the kwarg name `paper_id`,
-    # so we pass the arxiv_id under that name.
-    section_concepts = extract_concepts_from_sections(sections, paper_id=arxiv_id)
+        # 2) TEI -> sections
+        sections = extract_sections_from_tei(tei_path)
 
-    # 4) aggregate to ConceptSummary per concept
-    concept_summaries = aggregate_section_concepts(section_concepts)
+        # 3) sections -> per-section concepts
+        section_concepts = extract_concepts_from_sections(
+            sections,
+            paper_id=arxiv_id,
+        )
 
-    ingested = IngestedPaper(
-        arxiv_id=arxiv_id,
-        pdf_path=pdf_path,
-        tei_path=tei_path,
-        sections=list(sections),
-        section_concepts=section_concepts,
-        concept_summaries=concept_summaries,
-    )
+        # 4) aggregate to ConceptSummary per concept
+        concept_summaries = aggregate_section_concepts(section_concepts)
+
+        ingested = IngestedPaper(
+            arxiv_id=arxiv_id,
+            pdf_path=pdf_path,
+            tei_path=tei_path,
+            sections=list(sections),
+            section_concepts=section_concepts,
+            concept_summaries=concept_summaries,
+        )
+
+        # Persist cache for future runs
+        if use_cache:
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)  # type: ignore[union-attr]
+                with cache_path.open("wb") as f:  # type: ignore[union-attr]
+                    pickle.dump(ingested, f)
+            except Exception:
+                # Cache write failures should never break ingestion
+                pass
 
     # 5) optional Neo4j persistence
     if neo4j_session is not None:
@@ -304,34 +368,45 @@ def ingest_arxiv_paper(
     grobid_client: Optional[Any] = None,
     neo4j_session: Optional[Any] = None,
     references: Optional[List[str]] = None,
+    use_cache: bool = True,
+    force_reingest: bool = False,
 ) -> IngestedPaperResult:
     """
     High-level ingestion entrypoint for a paper identified by arxiv_id.
 
     This is the function your CLI calls:
 
-        ingest_arxiv_paper(arxiv_id=..., work_dir=...)
+        ingest_arxiv_paper(arxiv_id=..., work_dir=..., use_cache=..., force_reingest=...)
 
     Steps:
-      1. Download the PDF for arxiv_id into work_dir.
-      2. Run ingest_pdf (GROBID → TEI → sections → concepts).
+      1. Ensure the PDF for arxiv_id exists in work_dir (download if needed).
+      2. Run ingest_pdf (which has its own cache for TEI + concepts).
       3. Build an IngestedPaperResult with a Paper model populated from arXiv
          metadata where possible.
+
+    Flags
+    -----
+    use_cache:
+        Passed through to ingest_pdf (see its docstring).
+    force_reingest:
+        Passed through to ingest_pdf (see its docstring).
     """
-    from pathlib import Path as _Path  # just to be safe if called with str
+    work_dir = Path(work_dir)
 
-    work_dir = _Path(work_dir)
+    # 1) Ensure the PDF is present; don't re-download if it already exists
+    pdf_path = work_dir / f"{arxiv_id}.pdf"
+    if not pdf_path.exists():
+        pdf_path = _download_arxiv_pdf(arxiv_id, work_dir)
 
-    # 1) Download the PDF (will raise RuntimeError if arxiv_id is invalid)
-    pdf_path = _download_arxiv_pdf(arxiv_id, work_dir)
-
-    # 2) Run the core ingestion
+    # 2) Run the core ingestion (this will use the IngestedPaper cache if present)
     ingested = ingest_pdf(
-        pdf_path,
+        pdf_path=pdf_path,
         arxiv_id=arxiv_id,
         grobid_client=grobid_client,
         neo4j_session=neo4j_session,
         work_dir=work_dir,
+        use_cache=use_cache,
+        force_reingest=force_reingest,
     )
 
     # 3) Fetch metadata from arXiv and build a Paper model
@@ -347,11 +422,9 @@ def ingest_arxiv_paper(
 
         try:
             result = next(results)
-            # arxiv.Result has `.title` and `.summary` (abstract)
             title = result.title or ""
             abstract = result.summary or ""
         except StopIteration:
-            # Shouldn't happen if _download_arxiv_pdf succeeded, but be robust
             pass
     except Exception:
         # Metadata fetch failure shouldn't kill ingestion; fall back to blanks
@@ -372,6 +445,7 @@ def ingest_arxiv_paper(
         concept_summaries=ingested.concept_summaries,
         references=references,
     )
+
 # -----------------------------------------------------------------------------
 # Optional convenience: ingest + update NetworkX graph in one call
 # -----------------------------------------------------------------------------
