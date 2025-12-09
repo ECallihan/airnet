@@ -12,7 +12,10 @@ import networkx as nx
 from kg_ai_papers.config.settings import settings
 # Keep the import for type hints / compatibility, even if we don't rely on it.
 from kg_ai_papers.grobid_client import GrobidClient  # type: ignore[unused-import]
-from kg_ai_papers.tei_parser import extract_sections_from_tei
+from kg_ai_papers.tei_parser import (
+    extract_sections_from_tei,
+    extract_references_from_tei
+)
 from kg_ai_papers.nlp.concept_extraction import (
     SectionConcept,
     ConceptSummary,
@@ -333,15 +336,11 @@ def ingest_arxiv_paper(
     if not pdf_path.exists():
         pdf_path = _download_arxiv_pdf(arxiv_id, work_dir)
 
-    # 2) Run the core ingestion (this will use the IngestedPaper cache if present)
+    # 2) Run the core ingestion
     ingested = ingest_pdf(
         pdf_path=pdf_path,
-        arxiv_id=arxiv_id,
+        paper_id=arxiv_id,          # use arxiv_id as the canonical paper id
         grobid_client=grobid_client,
-        neo4j_session=neo4j_session,
-        work_dir=work_dir,
-        use_cache=use_cache,
-        force_reingest=force_reingest,
     )
 
     # 3) Fetch metadata from arXiv and build a Paper model
@@ -372,14 +371,24 @@ def ingest_arxiv_paper(
         pdf_path=str(pdf_path),
     )
 
+    # If no references were explicitly provided, extract them from the TEI
     if references is None:
-        references = []
+        try:
+            # This returns a list of kg_ai_papers.models.reference.Reference
+            # objects, each with .arxiv_id and .doi fields (among others).
+            ref_objects = extract_references_from_tei(ingested.tei_path)
+            references = ref_objects  # BFS knows how to handle these objects
+        except Exception:
+            # If anything goes wrong, fall back to an empty list so ingestion
+            # still succeeds.
+            references = []
 
     return IngestedPaperResult(
         paper=paper,
         concept_summaries=ingested.concept_summaries,
         references=references,
     )
+
 
 # -----------------------------------------------------------------------------
 # Optional convenience: ingest + update NetworkX graph in one call

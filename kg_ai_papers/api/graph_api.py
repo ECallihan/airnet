@@ -21,7 +21,7 @@ app = FastAPI()
 # Graph access
 # ---------------------------------------------------------------------------
 
-_GRAPH_CACHE: Optional[nx.MultiDiGraph] = None
+_GRAPH: Optional[nx.MultiDiGraph] = None
 
 # Thin wrapper so tests can monkeypatch graph_api.save_graph
 def save_graph(*args, **kwargs):
@@ -42,10 +42,10 @@ def _load_graph_from_disk() -> nx.MultiDiGraph:
     In tests, this function is bypassed because test modules monkeypatch
     get_graph() directly to return a small synthetic graph.
     """
-    global _GRAPH_CACHE
+    global _GRAPH
 
-    if _GRAPH_CACHE is not None:
-        return _GRAPH_CACHE
+    if _GRAPH is not None:
+        return _GRAPH
 
     G = load_latest_graph(settings.graph_dir)
     if G is None:
@@ -54,7 +54,7 @@ def _load_graph_from_disk() -> nx.MultiDiGraph:
             "Run the ingestion pipeline first."
         )
 
-    _GRAPH_CACHE = G
+    _GRAPH = G
     return G
 
 
@@ -63,10 +63,20 @@ def get_graph() -> nx.MultiDiGraph:
     Indirection point for retrieving the in-memory graph.
 
     Tests monkeypatch this function, so all endpoints must call get_graph()
-    rather than touching _GRAPH_CACHE directly.
+    rather than touching _GRAPH directly.
     """
     return _load_graph_from_disk()
 
+def reload_graph_from_disk() -> nx.MultiDiGraph:
+    """
+    Force a reload of the latest graph from disk into the in-memory singleton.
+
+    Useful after running a new batch/BFS ingestion without restarting
+    the API server.
+    """
+    global _GRAPH
+    _GRAPH = None
+    return _load_graph_from_disk()
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -624,6 +634,21 @@ def health() -> Dict[str, str]:
     """
     return {"status": "ok"}
 
+@app.post("/admin/reload-graph")
+def admin_reload_graph() -> Dict[str, Any]:
+    """
+    Admin endpoint: reload the latest saved graph from disk.
+
+    Call this after running the ingestion/BFS CLI so the UI
+    starts using the newest graph snapshot without restarting
+    Uvicorn.
+    """
+    G = reload_graph_from_disk()
+    return {
+        "status": "reloaded",
+        "graph_num_nodes": G.number_of_nodes(),
+        "graph_num_edges": G.number_of_edges(),
+    }
 
 # ---------------------------------------------------------------------------
 # Paper endpoint

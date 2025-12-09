@@ -373,24 +373,77 @@ def update_graph_with_ingested_paper(
 
     # ------------------------------------------------------------------
     # 3) References: base paper node -> referenced paper nodes
+    #     - Handle strings, dict-like refs, or objects with .arxiv_id / .doi
     # ------------------------------------------------------------------
-    for ref_arxiv_id in result.references or []:
-        if not ref_arxiv_id:
+    for ref in (result.references or []):
+        if not ref:
             continue
 
-        ref_id = ref_arxiv_id  # use bare id for referenced papers too
-        if not G.has_node(ref_id):
+        ref_arxiv_id = None
+        ref_doi = None
+        ref_title = None
+        ref_year = None
+
+        # Case 1: simple string → treat as arxiv id
+        if isinstance(ref, str):
+            ref_arxiv_id = ref
+
+        # Case 2: dict-like object
+        elif isinstance(ref, dict):
+            ref_arxiv_id = (
+                ref.get("arxiv_id")
+                or ref.get("arxivId")
+                or (
+                    ref.get("ids", {}).get("arxiv")
+                    if isinstance(ref.get("ids"), dict)
+                    else None
+                )
+            )
+            ref_doi = (
+                ref.get("doi")
+                or (
+                    ref.get("ids", {}).get("doi")
+                    if isinstance(ref.get("ids"), dict)
+                    else None
+                )
+            )
+            ref_title = ref.get("title")
+            ref_year = ref.get("year")
+
+        # Case 3: generic object (e.g. Reference dataclass)
+        else:
+            ref_arxiv_id = getattr(ref, "arxiv_id", None) or getattr(ref, "arxivId", None)
+            ref_doi = getattr(ref, "doi", None)
+            ref_title = getattr(ref, "title", None)
+            ref_year = getattr(ref, "year", None)
+
+        # Decide on a node id: prefer arxiv id, else DOI
+        node_id = None
+        if ref_arxiv_id:
+            node_id = ref_arxiv_id
+        elif ref_doi:
+            node_id = f"doi:{ref_doi}"
+
+        # If we still don't have anything usable, skip this reference
+        if not node_id:
+            continue
+
+        if not G.has_node(node_id):
             G.add_node(
-                ref_id,
+                node_id,
                 type=NodeType.PAPER.value,
-                arxiv_id=ref_id,
+                arxiv_id=ref_arxiv_id,
+                doi=ref_doi,
+                title=ref_title,
+                year=ref_year,
             )
 
         G.add_edge(
             paper_id,
-            ref_id,
+            node_id,
             type=EdgeType.PAPER_CITES_PAPER.value,
         )
+
 
     # ------------------------------------------------------------------
     # 4) Concepts: concept-layer nodes + mention edges
