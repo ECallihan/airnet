@@ -14,18 +14,24 @@ class GrobidClientError(Exception):
     """
     Domain-specific error for anything that goes wrong talking to Grobid.
     """
+    pass
 
 
 def process_fulltext(pdf_path: str) -> str:
     """
-    Send a PDF to Grobid and return TEI XML as string.
+    Send a PDF to Grobid and return TEI XML as a string.
 
     This function is intentionally strict about HTTP status codes,
     but it wraps *all* request-related errors into GrobidClientError
     so the pipeline can catch them and continue gracefully.
     """
-    url = settings.GROBID_URL.rstrip("/") + "/api/processFulltextDocument"
+    # Base URL from settings, normalized
+    base_url = settings.GROBID_URL.rstrip("/")
+    url = base_url + "/api/processFulltextDocument"
 
+    # Grobid POST parameters – conservative defaults, but we request
+    # consolidated header + citations and raw citations to get the
+    # richest possible reference signal.
     params: Dict[str, Any] = {
         "consolidateHeader": 1,
         "consolidateCitations": 1,
@@ -57,4 +63,6 @@ def process_fulltext(pdf_path: str) -> str:
             f"Grobid error {response.status_code}: {response.text[:200]}"
         )
 
+    # Return raw TEI XML as a unicode string; callers (parse_sections /
+    # parse_references) can treat this as an in-memory TEI document.
     return response.text

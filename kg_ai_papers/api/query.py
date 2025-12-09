@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+from pydantic import BaseModel
 
 import networkx as nx
 
@@ -9,6 +10,12 @@ from kg_ai_papers.graph.builder import paper_node_id
 
 
 # ---------- Small view models ----------
+class PaperDetail(BaseModel):
+    """
+    Wrapper for a single paper plus its influence view, used by the web layer.
+    """
+    paper: PaperSummary
+    influence: PaperInfluenceView
 
 @dataclass
 class PaperSummary:

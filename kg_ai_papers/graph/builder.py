@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from types import SimpleNamespace
 
 import networkx as nx
 import numpy as np
-from kg_ai_papers.ingest.pipeline import IngestedPaperResult
+
+if TYPE_CHECKING:
+    # Only imported for static type checking / IDEs; avoids runtime circular import
+    from kg_ai_papers.ingest.pipeline import IngestedPaperResult  # noqa: F401
 
 from kg_ai_papers.nlp.concept_extraction import ConceptSummary
 from kg_ai_papers.graph.schema import EdgeType, NodeType
 from kg_ai_papers.models.paper import Paper
-
 
 def _get_or_create_paper_node(G: nx.MultiDiGraph, paper: Paper) -> str:
     """
@@ -330,112 +332,97 @@ def get_paper_concept_edges(
     return list(edge_dict.values())
 
 def update_graph_with_ingested_paper(
-    graph: nx.MultiDiGraph,
-    result: Any,
-) -> nx.MultiDiGraph:
+    G: nx.MultiDiGraph,
+    result: "IngestedPaperResult",
+) -> None:
     """
-    Update the in-memory NetworkX graph with the output of ingestion.
+    Merge a single IngestedPaperResult into the in-memory graph.
 
-    This is intentionally tolerant about the shape of `result`:
-
-      - If `result` has a `.paper` attribute (IngestedPaperResult), we use it.
-      - If `result` looks like an IngestedPaper (has `.arxiv_id` and
-        `.concept_summaries` but no `.paper`), we normalize it on the fly.
-
-    Expected fields (either on `result` or on its `.paper`):
-
-      - paper.arxiv_id
-      - concept_summaries: Dict[str, ConceptSummary]
-      - references: Optional[List[str]]  (may be absent; treated as [])
+    - Adds/updates the base paper node (unprefixed arxiv_id).
+    - Adds referenced paper nodes and PAPER_CITES_PAPER edges.
+    - Adds concept-layer paper + concept nodes and PAPER_MENTIONS_CONCEPT edges.
     """
+    paper = result.paper
+    paper_id = paper.arxiv_id  # tests expect the *bare* arxiv_id as node id
 
     # ------------------------------------------------------------------
-    # Normalize `result` into a (paper-like, concept_summaries, references) triple
+    # 1) Upsert base paper node (unprefixed id: "p_ing_1")
     # ------------------------------------------------------------------
-    if hasattr(result, "paper"):
-        # High-level API: result is an IngestedPaperResult
-        paper: Paper = result.paper  # type: ignore[assignment]
-        concept_summaries: Dict[str, ConceptSummary] = (
-            getattr(result, "concept_summaries", {}) or {}
-        )
-        references: List[str] = list(getattr(result, "references", []) or [])
-    else:
-        # Lower-level API: result is an IngestedPaper from the ingestion pipeline.
-        arxiv_id = getattr(result, "arxiv_id", None)
-        if arxiv_id is None:
-            raise ValueError(
-                "update_graph_with_ingested_paper: result has no `.paper` "
-                "attribute and no `.arxiv_id`; cannot normalize."
-            )
+    node_data = dict(G.nodes[paper_id]) if G.has_node(paper_id) else {}
 
-        # Create a lightweight paper-like object without touching the real Paper model
-        paper = SimpleNamespace(
-            arxiv_id=arxiv_id,
-            title=getattr(result, "title", None),
-            year=getattr(result, "year", None),
-        )
-        concept_summaries = getattr(result, "concept_summaries", {}) or {}
-        references = []  # no citation info at this layer yet
+    node_data.setdefault("type", NodeType.PAPER.value)
+    node_data["title"] = getattr(paper, "title", node_data.get("title"))
+    node_data["abstract"] = getattr(paper, "abstract", node_data.get("abstract"))
+    node_data.setdefault("arxiv_id", paper_id)
+
+    G.add_node(paper_id, **node_data)
 
     # ------------------------------------------------------------------
-    # 1) Ensure the main paper node exists
+    # 2) Ensure concept-layer paper node exists ("paper:p_ing_1")
     # ------------------------------------------------------------------
-    paper_node = paper.arxiv_id
+    p_layer_node = paper_node_id(paper_id)  # e.g. "paper:p_ing_1"
 
-    if paper_node not in graph:
-        graph.add_node(
-            paper_node,
-            type="paper",
-            arxiv_id=paper.arxiv_id,
+    if not G.has_node(p_layer_node):
+        G.add_node(
+            p_layer_node,
+            type=NodeType.PAPER.value,
+            arxiv_id=paper_id,
             title=getattr(paper, "title", None),
-            year=getattr(paper, "year", None),
-        )
-    else:
-        # Update basic attributes if they are present
-        graph.nodes[paper_node].update(
-            {
-                "title": getattr(paper, "title", graph.nodes[paper_node].get("title")),
-                "year": getattr(paper, "year", graph.nodes[paper_node].get("year")),
-            }
+            abstract=getattr(paper, "abstract", None),
         )
 
     # ------------------------------------------------------------------
-    # 2) Attach concept summaries as concept nodes + edges
+    # 3) References: base paper node -> referenced paper nodes
     # ------------------------------------------------------------------
-    for key, summary in concept_summaries.items():
-        concept_node = f"concept::{key}"
+    for ref_arxiv_id in result.references or []:
+        if not ref_arxiv_id:
+            continue
 
-        if concept_node not in graph:
-            graph.add_node(
-                concept_node,
-                type="concept",
-                key=summary.concept_key,
-                name=summary.base_name,
-                kind=summary.kind,
+        ref_id = ref_arxiv_id  # use bare id for referenced papers too
+        if not G.has_node(ref_id):
+            G.add_node(
+                ref_id,
+                type=NodeType.PAPER.value,
+                arxiv_id=ref_id,
             )
 
-        graph.add_edge(
-            paper_node,
-            concept_node,
-            key=f"mentions::{paper_node}::{concept_node}",
-            type="MENTIONS",
-            mentions_total=summary.mentions_total,
-            weighted_score=summary.weighted_score,
-            mentions_by_section=summary.mentions_by_section,
+        G.add_edge(
+            paper_id,
+            ref_id,
+            type=EdgeType.PAPER_CITES_PAPER.value,
         )
 
     # ------------------------------------------------------------------
-    # 3) (Optional) Attach citation edges (paper -> referenced paper)
+    # 4) Concepts: concept-layer nodes + mention edges
     # ------------------------------------------------------------------
-    for ref_id in references:
-        ref_node = ref_id
-        if ref_node not in graph:
-            graph.add_node(ref_node, type="paper", arxiv_id=ref_id)
+    for concept_key, summary in (result.concept_summaries or {}).items():
+        c_node = concept_node_id(concept_key)  # e.g. "concept:c1"
 
-        graph.add_edge(
-            paper_node,
-            ref_node,
-            type="CITES",
+        if not G.has_node(c_node):
+            G.add_node(
+                c_node,
+                type=NodeType.CONCEPT.value,
+                label=getattr(summary, "base_name", None) or concept_key,
+                concept_key=getattr(summary, "concept_key", concept_key),
+                kind=getattr(summary, "kind", None),
+            )
+        else:
+            c_data = G.nodes[c_node]
+            c_data.setdefault("type", NodeType.CONCEPT.value)
+            c_data.setdefault(
+                "label",
+                getattr(summary, "base_name", None) or concept_key,
+            )
+            c_data.setdefault("concept_key", getattr(summary, "concept_key", concept_key))
+            if getattr(summary, "kind", None) is not None:
+                c_data.setdefault("kind", getattr(summary, "kind", None))
+
+        # Edge from concept-layer paper node -> concept node
+        G.add_edge(
+            p_layer_node,
+            c_node,
+            type=EdgeType.PAPER_MENTIONS_CONCEPT.value,
+            mentions_total=getattr(summary, "mentions_total", None),
+            mentions_by_section=getattr(summary, "mentions_by_section", None),
+            weighted_score=getattr(summary, "weighted_score", None),
         )
-
-    return graph

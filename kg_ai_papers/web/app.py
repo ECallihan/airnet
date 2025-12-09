@@ -22,9 +22,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from networkx import MultiDiGraph
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
+from dataclasses import asdict, is_dataclass
 
-from kg_ai_papers.api.models import PaperDetail, PaperInfluenceResult, PaperSummary
+from kg_ai_papers.api.models import (
+    PaperDetail as ApiPaperDetail,
+    PaperInfluenceResult,
+    PaperSummary as ApiPaperSummary,
+)
 from kg_ai_papers.api.query import get_paper_influence_view
+
 from kg_ai_papers.config.settings import settings
 from kg_ai_papers.graph.schema import NodeType
 from kg_ai_papers.graph.storage import save_graph, load_latest_graph
@@ -191,7 +197,12 @@ async def health() -> dict:
 
 @app.get(
     "/papers/{arxiv_id}",
-    response_model=PaperDetail,
+    response_model=ApiPaperDetail,
+    summary="Get a single paper and its influence view",
+)
+@app.get(
+    "/papers/{arxiv_id}",
+    response_model=Dict[str, Any],
     summary="Get a single paper and its influence view",
 )
 async def get_paper(
@@ -200,7 +211,7 @@ async def get_paper(
     top_k_concepts: int = 10,
     top_k_references: int = 10,
     top_k_influenced: int = 10,
-) -> PaperDetail:
+) -> Dict[str, Any]:
     """
     Return a detailed view of a single paper, including its metadata and
     influence information derived from the in-memory graph.
@@ -209,7 +220,7 @@ async def get_paper(
     """
     G = _get_graph(request.app)
 
-    # Check whether this arxiv_id exists in the graph at all
+    # Locate the paper metadata node
     paper_meta: Optional[Dict[str, Any]] = None
     for _, data in G.nodes(data=True):
         if data.get("arxiv_id") == arxiv_id:
@@ -217,10 +228,9 @@ async def get_paper(
             break
 
     if paper_meta is None:
-        # This is what the tests expect for the missing paper case
         raise HTTPException(status_code=404, detail=f"Paper {arxiv_id} not found")
 
-    # Call the (possibly monkeypatched) influence view builder
+    # Compute the influence view (dataclass-ish object) from the graph
     influence_view = get_paper_influence_view(
         G,
         arxiv_id=arxiv_id,
@@ -229,32 +239,41 @@ async def get_paper(
         top_k_influenced=top_k_influenced,
     )
 
-    # Normalise to a plain dict for PaperDetail.influence
-    if isinstance(influence_view, BaseModel):
-        influence_payload: Any = influence_view.model_dump()
+    # Convert the view into a plain dict so FastAPI/Pydantic can serialize it,
+    # and so tests can access top-level "paper" and "concepts" keys.
+    if isinstance(influence_view, dict):
+        payload: Dict[str, Any] = dict(influence_view)
+    elif is_dataclass(influence_view):
+        payload = asdict(influence_view)
+    elif hasattr(influence_view, "model_dump"):
+        # Just in case we ever swap to a Pydantic model here
+        payload = influence_view.model_dump()
     else:
-        influence_payload = influence_view
+        # Fallback: wrap minimal information
+        payload = {
+            "paper": {
+                "arxiv_id": arxiv_id,
+                "title": paper_meta.get("title") or "",
+            },
+            "concepts": [],
+        }
 
-    # Build the PaperSummary from graph metadata
-    paper_summary = PaperSummary(
-        arxiv_id=arxiv_id,
-        title=paper_meta.get("title") or "",
-        abstract=paper_meta.get("abstract"),
-    )
+    # Ensure the paper metadata includes the abstract from the graph, if present.
+    paper_dict = payload.setdefault("paper", {})
+    paper_dict.setdefault("arxiv_id", arxiv_id)
+    paper_dict.setdefault("title", paper_meta.get("title") or "")
+    if "abstract" not in paper_dict:
+        paper_dict["abstract"] = paper_meta.get("abstract")
 
-    # Wrap everything into PaperDetail
-    return PaperDetail(
-        paper=paper_summary,
-        influence=influence_payload,
-    )
+    return payload
 
 
 @app.get(
     "/papers",
-    response_model=List[PaperSummary],
+    response_model=List[ApiPaperSummary],
     summary="List all papers currently in the graph",
 )
-async def list_papers(request: Request) -> List[PaperSummary]:
+async def list_papers(request: Request) -> List[ApiPaperSummary]:
     """
     List all papers in the current in-memory graph.
 
@@ -263,14 +282,14 @@ async def list_papers(request: Request) -> List[PaperSummary]:
     """
     G = _get_graph(request.app)
 
-    summaries: List[PaperSummary] = []
+    summaries: List[ApiPaperSummary] = []
     for _, data in G.nodes(data=True):
         arxiv_id = data.get("arxiv_id")
         if not arxiv_id:
             continue
 
         summaries.append(
-            PaperSummary(
+            ApiPaperSummary(
                 arxiv_id=arxiv_id,
                 title=data.get("title") or "",
                 abstract=data.get("abstract") or "",

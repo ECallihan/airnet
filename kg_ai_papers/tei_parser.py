@@ -4,15 +4,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Sequence, Tuple, Union
+import re
 import xml.etree.ElementTree as ET
 
-from kg_ai_papers.models.reference import Reference  
+from kg_ai_papers.models.reference import Reference
 
-import re
-
-TEI_NS = {"tei": "http://www.tei-c.org/ns/1.0"}
+# Namespaces
+TEI_NS_DEFAULT = "http://www.tei-c.org/ns/1.0"
+TEI_NS = {"tei": TEI_NS_DEFAULT}
 XML_NS = "{http://www.w3.org/XML/1998/namespace}"
+
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -32,93 +38,106 @@ class PaperSection:
 
 
 # ---------------------------------------------------------------------------
-# Internal helpers
+# TEI parsing helpers
 # ---------------------------------------------------------------------------
 
 
-def _parse_tei_file(tei_path: Union[str, Path]) -> ET.Element:
+def _load_tei_content(tei: Union[str, Path]) -> str:
     """
-    Parse a TEI XML *file* and return the root element.
+    Accept either a TEI XML string or a filesystem path and return the XML text.
+
+    Heuristics:
+    - If `tei` is a Path, read it.
+    - If `tei` is a string that contains '<TEI', treat it as XML.
+    - Otherwise, if it looks like a path on disk, read it.
+    - As a last resort, treat the string as XML.
     """
-    path = Path(tei_path)
-    tree = ET.parse(path)
-    return tree.getroot()
+    if isinstance(tei, Path):
+        return tei.read_text(encoding="utf-8")
+
+    s = str(tei)
+    if "<TEI" in s or "<tei:" in s:
+        return s
+
+    p = Path(s)
+    if p.exists():
+        return p.read_text(encoding="utf-8")
+
+    return s
 
 
-def _parse_tei_any(tei_source: Union[str, Path, bytes]) -> ET.Element:
+def _parse_tei_any(tei: Union[str, Path]) -> Tuple[ET.Element, Optional[dict]]:
     """
-    Parse TEI from either:
-      - a filesystem path (str/Path)
-      - a raw XML string
-      - raw XML bytes
+    Parse TEI from XML string or path and detect the namespace.
 
-    This is used by the reference-extraction helper, which is exercised by
-    tests with an in-memory XML string.
+    Returns (root_element, namespace_dict_or_None).
     """
-    if isinstance(tei_source, bytes):
-        return ET.fromstring(tei_source)
+    xml_text = _load_tei_content(tei)
+    root = ET.fromstring(xml_text)
 
-    if isinstance(tei_source, Path):
-        return _parse_tei_file(tei_source)
+    if root.tag.startswith("{"):
+        uri = root.tag.split("}")[0].strip("{")
+        ns = {"tei": uri}
+    else:
+        ns = None
 
-    if isinstance(tei_source, str):
-        text = tei_source.strip()
-        # Heuristic: if it looks like XML markup, treat as XML string,
-        # otherwise assume it's a filesystem path.
-        if text.startswith("<") or text.startswith("<?xml"):
-            return ET.fromstring(text)
-        return _parse_tei_file(text)
-
-    raise TypeError(f"Unsupported TEI source type: {type(tei_source)!r}")
+    return root, ns
 
 
-def _iter_section_divs(root: ET.Element) -> Iterable[ET.Element]:
+def _iter_section_divs(root: ET.Element, ns: Optional[dict]) -> Iterable[ET.Element]:
     """
-    Yield all <div> elements within the main text body of a TEI document.
+    Iterate over section-like <div> elements in the TEI <body>.
+
+    We support both namespaced and non-namespaced TEI.
     """
-    # Typical GROBID layout: TEI/text/body/div
-    xpath = ".//tei:text/tei:body//tei:div"
-    yield from root.findall(xpath, TEI_NS)
+    if ns:
+        # Any <div> inside <text>/<body>
+        return root.findall(".//tei:text/tei:body//tei:div", ns)
+    return root.findall(".//text/body//div")
 
 
-def _div_title(div: ET.Element) -> Optional[str]:
+def _div_title(div: ET.Element, ns: Optional[dict]) -> Optional[str]:
     """
-    Extract a human-readable title for a section <div>, if present.
+    Extract the title of a section from a <div>, typically from its <head>.
     """
-    head = div.find("tei:head", TEI_NS)
-    if head is not None:
-        text = "".join(head.itertext()).strip()
-        return text or None
+    if ns:
+        head = div.find("tei:head", ns)
+    else:
+        head = div.find("head")
+
+    if head is not None and head.text:
+        return head.text.strip()
     return None
+
+
+def _normalize_whitespace(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _div_text(div: ET.Element) -> str:
     """
-    Extract the concatenated plain-text content of a <div>.
-
-    We keep it simple for now: concatenate all <p> descendants' text.
+    Aggregate all descendant text from a <div> into a single normalized string.
     """
-    parts: List[str] = []
-    for p in div.findall(".//tei:p", TEI_NS):
-        chunk = " ".join(t.strip() for t in p.itertext() if t.strip())
-        if chunk:
-            parts.append(chunk)
-    return "\n\n".join(parts).strip()
+    pieces: List[str] = []
+    for t in div.itertext():
+        if t:
+            pieces.append(t)
+    return _normalize_whitespace(" ".join(pieces))
 
 
 # ---------------------------------------------------------------------------
-# Public API – section extraction
+# Section extraction
 # ---------------------------------------------------------------------------
 
 
-def extract_sections_from_tei(tei_path: Union[str, Path]) -> List[PaperSection]:
+def extract_sections_from_tei(tei_path_or_xml: Union[str, Path]) -> List[PaperSection]:
     """
-    Extract a flat list of top-level sections from a TEI XML file.
+    Extract a flat list of top-level sections from a TEI XML document or file.
 
     Parameters
     ----------
-    tei_path:
-        Path to the TEI XML produced by GROBID.
+    tei_path_or_xml:
+        Either a TEI XML string or a path to the TEI XML produced by GROBID.
 
     Returns
     -------
@@ -127,16 +146,17 @@ def extract_sections_from_tei(tei_path: Union[str, Path]) -> List[PaperSection]:
         content. For now we treat everything as level=1 and use a simple
         one-element `path` based on the section title.
     """
-    root = _parse_tei_file(tei_path)
+    root, ns = _parse_tei_any(tei_path_or_xml)
     sections: List[PaperSection] = []
 
-    for div in _iter_section_divs(root):
-        sec_id = div.get(f"{XML_NS}id")
-        title = _div_title(div)
+    for div in _iter_section_divs(root, ns):
+        # xml:id or plain id
+        sec_id = div.get(f"{XML_NS}id") or div.get("id")
+        title = _div_title(div, ns)
         text = _div_text(div)
 
         if not title and not text:
-            # Skip completely empty structural divs
+            # Skip completely empty structures
             continue
 
         section = PaperSection(
@@ -152,227 +172,156 @@ def extract_sections_from_tei(tei_path: Union[str, Path]) -> List[PaperSection]:
 
 
 # ---------------------------------------------------------------------------
-# Public API – reference extraction
+# Reference extraction
 # ---------------------------------------------------------------------------
 
+_ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})(v\d+)?", re.IGNORECASE)
 
-def _extract_bibl_struct_references(root: ET.Element) -> List[Reference]:
+
+def _findall_bibl_structs(root: ET.Element, ns: Optional[dict]) -> List[ET.Element]:
+    if ns:
+        return root.findall(".//tei:listBibl/tei:biblStruct", ns)
+    return root.findall(".//listBibl/biblStruct")
+
+
+def _get_bibl_title(bibl: ET.Element, ns: Optional[dict]) -> Optional[str]:
+    # Prefer analytic/title, then monogr/title
+    if ns:
+        el = bibl.find(".//tei:analytic/tei:title", ns)
+        if el is None:
+            el = bibl.find(".//tei:monogr/tei:title", ns)
+    else:
+        el = bibl.find(".//analytic/title")
+        if el is None:
+            el = bibl.find(".//monogr/title")
+
+    if el is not None and el.text:
+        return el.text.strip()
+    return None
+
+
+def _get_bibl_authors(bibl: ET.Element, ns: Optional[dict]) -> List[str]:
     """
-    Low-level helper that walks all <biblStruct> elements in the TEI
-    back matter and converts them into `Reference` objects.
-
-    We keep this intentionally forgiving: any missing fields are left as
-    None or empty where appropriate.
+    Collect authors as "Surname, Forename" strings.
     """
-    refs: List[Reference] = []
+    authors: List[str] = []
 
-    # Typical GROBID layout for references:
-    # TEI/text/back/listBibl/biblStruct
-    for bibl in root.findall(".//tei:text/tei:back//tei:listBibl//tei:biblStruct", TEI_NS):
-        # Title – prefer analytic/title, then monogr/title
-        title_el = (
-            bibl.find(".//tei:analytic/tei:title", TEI_NS)
-            or bibl.find(".//tei:monogr/tei:title", TEI_NS)
-        )
-        title = "".join(title_el.itertext()).strip() if title_el is not None else None
+    if ns:
+        pers_elems: List[ET.Element] = []
+        pers_elems.extend(bibl.findall(".//tei:analytic/tei:author/tei:persName", ns))
+        pers_elems.extend(bibl.findall(".//tei:monogr/tei:author/tei:persName", ns))
+    else:
+        pers_elems = []
+        pers_elems.extend(bibl.findall(".//analytic/author/persName"))
+        pers_elems.extend(bibl.findall(".//monogr/author/persName"))
 
-        # Authors – collect "Forename Surname" strings
-        author_names: List[str] = []
-        for pers in bibl.findall(".//tei:author/tei:persName", TEI_NS):
-            forename_el = pers.find("tei:forename", TEI_NS)
-            surname_el = pers.find("tei:surname", TEI_NS)
-            forename = forename_el.text.strip() if forename_el is not None and forename_el.text else ""
-            surname = surname_el.text.strip() if surname_el is not None and surname_el.text else ""
-            name = " ".join(part for part in (forename, surname) if part)
-            if name:
-                author_names.append(name)
+    for pers in pers_elems:
+        if ns:
+            fn = pers.find("tei:forename", ns)
+            sn = pers.find("tei:surname", ns)
+        else:
+            fn = pers.find("forename")
+            sn = pers.find("surname")
 
-        # Year – from imprint/date/@when if available
-        year: Optional[int] = None
-        date_el = bibl.find(".//tei:imprint/tei:date", TEI_NS)
-        if date_el is not None:
-            when = (date_el.get("when") or "").strip()
-            if len(when) >= 4 and when[:4].isdigit():
-                year = int(when[:4])
+        forename = fn.text.strip() if (fn is not None and fn.text) else None
+        surname = sn.text.strip() if (sn is not None and sn.text) else None
 
-        # DOI and arXiv identifiers
-        doi: Optional[str] = None
-        arxiv_id: Optional[str] = None
+        # Format as "Surname, Forename" to match tests
+        if surname and forename:
+            authors.append(f"{surname}, {forename}")
+        elif surname:
+            authors.append(surname)
+        elif forename:
+            authors.append(forename)
 
-        for idno in bibl.findall(".//tei:idno", TEI_NS):
-            id_type = (idno.get("type") or "").lower()
-            value = (idno.text or "").strip()
-            if not value:
-                continue
-            if id_type == "doi" and doi is None:
-                doi = value
-            elif id_type == "arxiv" and arxiv_id is None:
-                # Normalise common TEI / GROBID forms, e.g. "arXiv:2101.00001"
-                v = value
-                if ":" in v:
-                    _, v = v.split(":", 1)
-                # Strip version suffix like "v2" if present
-                v = v.strip()
-                if v and "v" in v and v.split("v", 1)[1].isdigit():
-                    v = v.split("v", 1)[0]
-                arxiv_id = v
-
-        # Construct a Reference instance *without* calling its __init__
-        # so we don't need to know the full constructor signature.
-        ref = Reference.__new__(Reference)  # type: ignore[misc]
-
-        # Populate a few common attributes that downstream code / tests
-        # are likely to use. Because dataclasses typically do not use
-        # __slots__, setting these is safe even if they weren't declared.
-        setattr(ref, "title", title)
-        setattr(ref, "authors", author_names)
-        setattr(ref, "year", year)
-        setattr(ref, "doi", doi)
-        setattr(ref, "arxiv_id", arxiv_id)
-
-        refs.append(ref)
-
-    return refs
+    return authors
 
 
-def extract_references_from_tei(tei_xml: str) -> List[Reference]:
+def _get_bibl_year(bibl: ET.Element, ns: Optional[dict]) -> Optional[int]:
+    """
+    Extract a 4-digit publication year from imprint/date or date elements.
+    """
+    if ns:
+        date_el = bibl.find(".//tei:imprint/tei:date", ns)
+        if date_el is None:
+            date_el = bibl.find(".//tei:date", ns)
+    else:
+        date_el = bibl.find(".//imprint/date") or bibl.find(".//date")
+
+    if date_el is None:
+        return None
+
+    val = (
+        date_el.get("when")
+        or date_el.get("when-iso")
+        or (date_el.text.strip() if date_el.text else None)
+    )
+    if not val:
+        return None
+
+    m = re.search(r"(\d{4})", val)
+    return int(m.group(1)) if m else None
+
+
+def _get_bibl_ids(bibl: ET.Element, ns: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extract (doi, arxiv_id) from <idno> elements, normalizing arXiv IDs.
+    """
+    if ns:
+        idnos = bibl.findall(".//tei:idno", ns)
+    else:
+        idnos = bibl.findall(".//idno")
+
+    doi: Optional[str] = None
+    arxiv_id: Optional[str] = None
+
+    for idno in idnos:
+        id_type = (idno.get("type") or "").lower()
+        text = (idno.text or "").strip()
+        if not text:
+            continue
+
+        if id_type == "doi" and doi is None:
+            doi = text
+
+        elif id_type.startswith("arxiv") and arxiv_id is None:
+            # Normalize "arXiv:2101.00001" → "2101.00001"
+            m = _ARXIV_ID_RE.search(text)
+            arxiv_id = m.group(1) if m else text
+
+    return doi, arxiv_id
+
+
+def extract_references_from_tei(tei_xml_or_path: Union[str, Path]) -> List[Reference]:
     """
     Parse TEI XML and extract a list of Reference objects from <listBibl>/<biblStruct>.
 
     We try to be robust to:
     - TEI default namespaces (xmlns="http://www.tei-c.org/ns/1.0")
-    - Titles living under <analytic><title> (common for articles) or <monogr><title>
-    - Authors encoded as <analytic><author><persName><forename>/<surname>
-    - Dates with @when/@when-iso or plain text
+    - Titles in <analytic><title> or <monogr><title>
+    - Authors encoded as <persName><forename>/<surname>
+    - Dates with @when/@when-iso or text
     - DOIs and arXiv IDs inside <idno type="DOI"> / <idno type="arXiv">
     """
-
-    root = ET.fromstring(tei_xml)
-
-    # Detect TEI namespace if present
-    if root.tag.startswith("{"):
-        uri = root.tag.split("}")[0].strip("{")
-        ns = {"tei": uri}
-    else:
-        ns = None
-
-    def findall_bibl_structs() -> List[ET.Element]:
-        if ns:
-            return root.findall(".//tei:listBibl/tei:biblStruct", ns)
-        return root.findall(".//listBibl/biblStruct")
-
-    def get_title(bibl: ET.Element) -> Optional[str]:
-        # Prefer analytic/title, then fall back to monogr/title
-        if ns:
-            el = bibl.find(".//tei:analytic/tei:title", ns)
-            if el is None:
-                el = bibl.find(".//tei:monogr/tei:title", ns)
-        else:
-            el = bibl.find(".//analytic/title")
-            if el is None:
-                el = bibl.find(".//monogr/title")
-
-        if el is not None and el.text:
-            return el.text.strip()
-        return None
-
-    def get_authors(bibl: ET.Element) -> List[str]:
-        # Collect <persName> from analytic/author and monogr/author
-        authors: List[str] = []
-
-        if ns:
-            pers_elems = []
-            pers_elems.extend(bibl.findall(".//tei:analytic/tei:author/tei:persName", ns))
-            pers_elems.extend(bibl.findall(".//tei:monogr/tei:author/tei:persName", ns))
-        else:
-            pers_elems = []
-            pers_elems.extend(bibl.findall(".//analytic/author/persName"))
-            pers_elems.extend(bibl.findall(".//monogr/author/persName"))
-
-        for pers in pers_elems:
-            if ns:
-                fn = pers.find("tei:forename", ns)
-                sn = pers.find("tei:surname", ns)
-            else:
-                fn = pers.find("forename")
-                sn = pers.find("surname")
-
-            forename = fn.text.strip() if (fn is not None and fn.text) else None
-            surname = sn.text.strip() if (sn is not None and sn.text) else None
-
-            # Format as "Surname, Forename" to match test expectations
-            if surname and forename:
-                authors.append(f"{surname}, {forename}")
-            elif surname:
-                authors.append(surname)
-            elif forename:
-                authors.append(forename)
-
-        return authors
-
-    def get_year(bibl: ET.Element) -> Optional[int]:
-        # Common pattern: monogr/imprint/date[@when]
-        if ns:
-            date_el = bibl.find(".//tei:imprint/tei:date", ns) or bibl.find(".//tei:date", ns)
-        else:
-            date_el = bibl.find(".//imprint/date") or bibl.find(".//date")
-
-        if date_el is None:
-            return None
-
-        val = (
-            date_el.get("when")
-            or date_el.get("when-iso")
-            or (date_el.text.strip() if date_el.text else None)
-        )
-        if not val:
-            return None
-
-        m = re.search(r"(\d{4})", val)
-        return int(m.group(1)) if m else None
-
-    def get_ids(bibl: ET.Element) -> tuple[Optional[str], Optional[str]]:
-        # Returns (doi, arxiv_id)
-        if ns:
-            idnos = bibl.findall(".//tei:idno", ns)
-        else:
-            idnos = bibl.findall(".//idno")
-
-        doi: Optional[str] = None
-        arxiv_id: Optional[str] = None
-
-        for idno in idnos:
-            id_type = (idno.get("type") or "").lower()
-            text = (idno.text or "").strip()
-            if not text:
-                continue
-
-            if id_type == "doi" and doi is None:
-                doi = text
-
-            elif id_type.startswith("arxiv") and arxiv_id is None:
-                # Normalize "arXiv:2101.00001" → "2101.00001"
-                m = re.search(r"(\d{4}\.\d{4,5})(v\d+)?", text)
-                arxiv_id = m.group(1) if m else text
-
-        return doi, arxiv_id
+    root, ns = _parse_tei_any(tei_xml_or_path)
 
     references: List[Reference] = []
 
-    for idx, bibl in enumerate(findall_bibl_structs()):
-        title = get_title(bibl)
-        authors = get_authors(bibl)
-        year = get_year(bibl)
-        doi, arxiv_id = get_ids(bibl)
+    for idx, bibl in enumerate(_findall_bibl_structs(root, ns)):
+        title = _get_bibl_title(bibl, ns)
+        authors = _get_bibl_authors(bibl, ns)
+        year = _get_bibl_year(bibl, ns)
+        doi, arxiv_id = _get_bibl_ids(bibl, ns)
 
-        # Raw TEI snippet for this reference
+        # Raw TEI snippet and a normalized raw-text version
         raw_xml = ET.tostring(bibl, encoding="unicode")
+        raw_text = _normalize_whitespace(" ".join(bibl.itertext())) or raw_xml
 
-        # Key derivation rules:
-        # 1. Use arXiv ID if present
-        # 2. Else use title (+ year) if present
-        # 3. Else fall back to DOI
-        # 4. Else synthetic key
+        # Derive a stable key:
+        # 1. arXiv ID if present
+        # 2. title (+ year) if present
+        # 3. DOI
+        # 4. synthetic fallback
         if arxiv_id:
             key = arxiv_id
         elif title:
@@ -387,28 +336,48 @@ def extract_references_from_tei(tei_xml: str) -> List[Reference]:
 
         ref = Reference(
             key=key,
-            raw=raw_xml,
+            raw=raw_text,
             title=title,
-            authors=authors,
             year=year,
             doi=doi,
             arxiv_id=arxiv_id,
+            authors=authors,
         )
-
         references.append(ref)
 
     return references
 
 
 # ---------------------------------------------------------------------------
-# Backwards-compatible aliases expected by kg_ai_papers.parsing.pipeline
+# Backwards-compatible aliases expected by other modules
 # ---------------------------------------------------------------------------
 
+
 def parse_sections(tei_path: Path | str) -> List[PaperSection]:
-    """Compatibility wrapper around extract_sections_from_tei."""
+    """
+    Compatibility wrapper around extract_sections_from_tei.
+
+    Accepts either a TEI XML string or a path.
+    """
     return extract_sections_from_tei(tei_path)
 
 
 def parse_references(tei_path: Path | str) -> List[str]:
-    """Compatibility wrapper around extract_references_from_tei."""
-    return extract_references_from_tei(tei_path)
+    """
+    Compatibility wrapper around extract_references_from_tei.
+
+    Returns a simple list of identifier strings, preferring:
+    - arxiv_id
+    - then DOI
+    - then Reference.key
+    """
+    refs = extract_references_from_tei(tei_path)
+    ids: List[str] = []
+    for r in refs:
+        if r.arxiv_id:
+            ids.append(r.arxiv_id)
+        elif r.doi:
+            ids.append(r.doi)
+        else:
+            ids.append(r.key)
+    return ids

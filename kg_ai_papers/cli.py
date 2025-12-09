@@ -1,4 +1,4 @@
-# kg_ai_papers/cli/__init__.py
+# kg_ai_papers/cli.py
 
 from __future__ import annotations
 
@@ -41,8 +41,7 @@ def _parse_seed_arg(raw: str) -> SeedPaper:
 def bfs_ingest(
     ids: List[str] = typer.Argument(
         ...,
-        help="Seed arXiv IDs or DOIs to start BFS from "
-             "(e.g. 2401.00001 2401.01234 10.1000/xyz123 ...).",
+        help="Seed arXiv IDs or DOIs to start BFS from (e.g. 2401.00001 10.1000/xyz123 ...).",
     ),
     max_papers: int = typer.Option(
         50,
@@ -92,6 +91,5 @@ def bfs_ingest(
     )
 
 
-def main() -> None:
-    """Entry point for `python -m kg_ai_papers.cli`."""
+if __name__ == "__main__":
     app()

@@ -1,194 +1,183 @@
+# kg_ai_papers/grobid_client.py
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from multiprocessing import cpu_count
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence
+from typing import Optional, Union, Dict, Any
+import os
 
 import requests
 
 from kg_ai_papers.config.settings import settings
 
 
-# ---------------------------------------------------------------------------
-# Thread pool for parallel GROBID calls (used by parse_batch)
-# ---------------------------------------------------------------------------
-
-def _default_max_workers() -> int:
-    try:
-        return max(1, cpu_count() // 2)
-    except NotImplementedError:
-        return 1
-
-
-_GROBID_MAX_WORKERS: int = getattr(
-    settings,
-    "grobid_max_workers",
-    _default_max_workers(),
-)
-
-_executor = ThreadPoolExecutor(max_workers=_GROBID_MAX_WORKERS)
-
-
-# ---------------------------------------------------------------------------
-# Client
-# ---------------------------------------------------------------------------
-
-
-class GrobidClient:
+@dataclass
+class GrobidClientConfig:
     """
-    Lightweight client for a running GROBID service.
+    Configuration for talking to a GROBID server.
+    """
 
-    Typical usage:
+    base_url: str
+    timeout: int = 60
 
-        client = GrobidClient()  # uses settings.grobid_url
-        tei_path = client.parse_pdf_to_tei(Path("paper.pdf"))
+    @classmethod
+    def from_env(cls) -> "GrobidClientConfig":
+        """
+        Build configuration from environment variables and global settings.
 
-    The main entry point for the ingestion pipeline is `parse_pdf_to_tei`,
-    which takes a local PDF path and returns the path of the TEI XML file.
+        Priority for base_url:
+        - AIRNET_GROBID_URL
+        - GROBID_URL
+        - settings.GROBID_URL
+        """
+        base_url = (
+            os.getenv("AIRNET_GROBID_URL")
+            or os.getenv("GROBID_URL")
+            or settings.GROBID_URL
+        )
+        base_url = base_url.rstrip("/")
+
+        timeout_str = os.getenv("AIRNET_GROBID_TIMEOUT") or os.getenv("GROBID_TIMEOUT")
+        timeout = int(timeout_str) if timeout_str is not None else 60
+
+        return cls(base_url=base_url, timeout=timeout)
+
+
+class GrobidClientError(RuntimeError):
+    """
+    Error raised when a GROBID request fails.
+
+    Tests import this as:
+        from kg_ai_papers.grobid_client import GrobidClientError
     """
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        timeout: int = 60,
-        session: Optional[requests.Session] = None,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        url: Optional[str] = None,
     ) -> None:
-        # Use Settings.GROBID_URL as the default
-        raw_url = base_url or settings.GROBID_URL
-        self.base_url: str = raw_url.rstrip("/")
-        self.timeout: int = timeout
-        self.session: requests.Session = session or requests.Session()
+        super().__init__(message)
+        self.status_code = status_code
+        self.url = url
+
+
+class GrobidClient:
+    """
+    Minimal HTTP client for GROBID, matching the test expectations.
+
+    Methods:
+        - healthcheck() -> bool
+        - is_alive() -> bool (alias)
+        - process_pdf(pdf_path, paper_id=None) -> Path
+        - parse_pdf_to_tei(pdf_path, paper_id=None) -> Path (alias)
+    """
+
+    def __init__(
+        self,
+        config: Optional[GrobidClientConfig] = None,
+        *,
+        base_url: Optional[str] = None,
+        timeout: Optional[int] = None,
+    ) -> None:
+        if config is None:
+            config = GrobidClientConfig.from_env()
+
+        if base_url is not None:
+            config.base_url = base_url.rstrip("/")
+        if timeout is not None:
+            config.timeout = timeout
+
+        self.config = config
+        self.base_url: str = config.base_url
+        self.timeout: int = config.timeout
 
     # ------------------------------------------------------------------
-    # Health checks
+    # Healthcheck
     # ------------------------------------------------------------------
-
     def is_alive(self) -> bool:
         """
-        Return True if the remote GROBID service responds on /api/isalive.
+        Call /api/isalive and return True if HTTP 200 and body contains 'true'.
         """
         url = f"{self.base_url}/api/isalive"
         try:
-            resp = self.session.get(url, timeout=self.timeout)
-            return resp.status_code == 200
+            resp = requests.get(url, timeout=self.timeout)
         except Exception:
             return False
 
-    # ------------------------------------------------------------------
-    # Core processing
-    # ------------------------------------------------------------------
+        if not resp.ok:
+            return False
 
-    def parse_pdf_to_tei(
+        text = (resp.text or "").strip().lower()
+        return "true" in text
+
+    def healthcheck(self) -> bool:
+        """
+        Public healthcheck method used by tests.
+        """
+        return self.is_alive()
+
+    # ------------------------------------------------------------------
+    # Core PDF -> TEI call
+    # ------------------------------------------------------------------
+    def process_pdf(
         self,
-        pdf_path: Path,
-        tei_path: Optional[Path] = None,
-        consolidate_header: int = 1,
-        consolidate_citations: int = 1,
-        include_raw_citations: int = 0,
+        pdf_path: Union[str, Path],
+        paper_id: Optional[str] = None,
     ) -> Path:
         """
-        Send a single PDF to GROBID's processFulltextDocument endpoint and
-        write the TEI XML response to disk.
+        Send a PDF to GROBID /api/processFulltextDocument and return the TEI path.
 
-        Parameters
-        ----------
-        pdf_path:
-            Local path to the input PDF.
-        tei_path:
-            Optional explicit output path for the TEI XML. If omitted, we
-            use `pdf_path.with_suffix(".tei.xml")`.
-        consolidate_header:
-            GROBID consolidateHeader parameter (0/1).
-        consolidate_citations:
-            GROBID consolidateCitations parameter (0/1).
-        include_raw_citations:
-            GROBID includeRawCitations parameter (0/1).
-
-        Returns
-        -------
-        Path to the TEI XML file on disk.
+        If paper_id is provided, it is used for the TEI filename stem;
+        otherwise we derive it from pdf_path.stem.
         """
         pdf_path = Path(pdf_path)
-        if tei_path is None:
-            tei_path = pdf_path.with_suffix(".tei.xml")
-        else:
-            tei_path = Path(tei_path)
+        if not pdf_path.exists():
+            raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         url = f"{self.base_url}/api/processFulltextDocument"
 
-        with pdf_path.open("rb") as f:
-            files = {"input": ("file.pdf", f, "application/pdf")}
-            data = {
-                "consolidateHeader": str(consolidate_header),
-                "consolidateCitations": str(consolidate_citations),
-                "includeRawCitations": str(include_raw_citations),
-            }
+        files = {"input": pdf_path.open("rb")}
+        data: Dict[str, Any] = {
+            "consolidateHeader": 1,
+            "consolidateCitations": 0,
+            "teiCoordinates": "none",
+        }
 
-            resp = self.session.post(
-                url,
-                files=files,
-                data=data,
-                timeout=self.timeout,
+        try:
+            resp = requests.post(url, files=files, data=data, timeout=self.timeout)
+        except Exception as exc:
+            raise GrobidClientError(
+                f"Error connecting to GROBID at {url}: {exc}",
+                url=url,
+            ) from exc
+        finally:
+            files["input"].close()
+
+        if not resp.ok:
+            raise GrobidClientError(
+                f"GROBID returned HTTP {resp.status_code} for {url}",
+                status_code=resp.status_code,
+                url=url,
             )
 
-        # Raise for non-2xx, so ingestion can log and continue
-        resp.raise_for_status()
+        # Determine TEI output path
+        stem = paper_id if paper_id is not None else pdf_path.stem
+        tei_dir = settings.DATA_DIR / "tei"
+        tei_dir.mkdir(parents=True, exist_ok=True)
+        tei_path = tei_dir / f"{stem}.tei.xml"
 
-        tei_path.write_bytes(resp.content)
+        tei_path.write_text(resp.text, encoding="utf-8")
         return tei_path
 
-    def parse_batch(
+    def parse_pdf_to_tei(
         self,
-        pdf_paths: Sequence[Path],
-        consolidate_header: int = 1,
-        consolidate_citations: int = 1,
-        include_raw_citations: int = 0,
-    ) -> List[Path]:
+        pdf_path: Union[str, Path],
+        paper_id: Optional[str] = None,
+    ) -> Path:
         """
-        Convenience helper: process many PDFs in parallel using the shared
-        thread pool configured by settings.grobid_max_workers.
-
-        Returns a list of TEI paths in the same order as pdf_paths.
+        Backwards-compatible alias for process_pdf, used by some pipeline code.
         """
-        pdf_paths = [Path(p) for p in pdf_paths]
-
-        futures = [
-            _executor.submit(
-                self.parse_pdf_to_tei,
-                pdf_path=p,
-                tei_path=None,
-                consolidate_header=consolidate_header,
-                consolidate_citations=consolidate_citations,
-                include_raw_citations=include_raw_citations,
-            )
-            for p in pdf_paths
-        ]
-
-        results: List[Path] = []
-        for f in futures:
-            # Any exception here will propagate to the caller, which is fine:
-            # ingestion code can catch/log and move on.
-            results.append(f.result())
-
-        return results
-
-    # ------------------------------------------------------------------
-    # Context-manager helpers (optional sugar)
-    # ------------------------------------------------------------------
-
-    def close(self) -> None:
-        """
-        Close the underlying requests.Session.
-        """
-        try:
-            self.session.close()
-        except Exception:
-            # Not critical, swallow errors on shutdown.
-            pass
-
-    def __enter__(self) -> "GrobidClient":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
+        return self.process_pdf(pdf_path, paper_id=paper_id)
