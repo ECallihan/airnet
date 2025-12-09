@@ -36,11 +36,13 @@ class BFSConfig:
     max_depth  : BFS depth (0 = seeds, 1 = their references, etc.)
     use_cache  : whether to reuse ingest cache from previous runs
     work_dir   : where PDFs/TEI/cache live for this run
+    start_fresh: if True, ignore any existing graph and start from empty
     """
     max_papers: int = 200
     max_depth: int = 2
     use_cache: bool = True
     work_dir: Path = Path("data/bfs_ingest")
+    start_fresh: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +101,7 @@ def _iter_reference_ids(
                 arxiv_id = arxiv_id or ids.get("arxiv") or ids.get("arxiv_id")
                 doi = doi or ids.get("doi") or ids.get("DOI")
         else:
-            # Object with attributes
+            # Object with attributes (e.g. your Reference dataclass)
             arxiv_id = (
                 getattr(ref, "arxiv_id", None)
                 or getattr(ref, "arxivId", None)
@@ -172,12 +174,18 @@ def bfs_seed_and_expand(
     if grobid_client is None:
         grobid_client = GrobidClient()
 
-    # Load the latest saved graph, or start a fresh one
-    G_loaded = load_latest_graph()
-    if G_loaded is None:
+    # Load the latest saved graph, or start a fresh one depending on config
+    if config.start_fresh:
+        print("[INFO] Starting BFS ingest from a fresh empty graph")
         G: nx.MultiDiGraph = nx.MultiDiGraph()
     else:
-        G = G_loaded
+        G_loaded = load_latest_graph()
+        if G_loaded is None:
+            print("[INFO] No existing graph found; starting fresh")
+            G = nx.MultiDiGraph()
+        else:
+            print("[INFO] Loaded existing graph; continuing BFS ingest on top")
+            G = G_loaded
 
     queue: Deque[Tuple[SeedPaper, int]] = deque()
     seen: Set[str] = set()
@@ -221,7 +229,7 @@ def bfs_seed_and_expand(
         else:
             print(f"[DEBUG] {seed} -> no references")
 
-        # Push into the graph
+        # Push into the graph (this adds paper, concepts, and citation edges)
         try:
             update_graph_with_ingested_paper(G, result)
         except Exception as exc:  # noqa: BLE001
@@ -234,7 +242,7 @@ def bfs_seed_and_expand(
         if next_depth > config.max_depth:
             continue
 
-        for ref_arxiv, ref_doi in _iter_reference_ids(result.references):
+        for ref_arxiv, ref_doi in _iter_reference_ids(result.references or []):
             key = _seen_key(ref_arxiv, ref_doi)
             if key is None:
                 continue

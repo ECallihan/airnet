@@ -206,7 +206,7 @@ class Settings(BaseSettings):
 
     @property
     def graph_dir(self) -> Path:
-        return self.DATA_DIR / "graph"
+        return self.DATA_DIR / "graphs"
 
     @property
     def embedding_batch_size(self) -> int:

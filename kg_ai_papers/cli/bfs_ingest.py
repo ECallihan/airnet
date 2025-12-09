@@ -57,7 +57,14 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_false",
         help="Disable ingestion cache.",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--start-fresh",
+        action="store_true",
+        help="Start from an empty graph instead of extending the latest saved graph.",
+    )
+
+    args = parser.parse_args(list(argv))
+    return args
 
 
 def _collect_seed_ids(args: argparse.Namespace) -> List[str]:
